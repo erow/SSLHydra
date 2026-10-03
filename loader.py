@@ -8,6 +8,7 @@ import hashlib
 import math
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -213,6 +214,30 @@ def _warm_one_batch(loader):
         it.join(timeout=300)
 
 
+def _warmup_marker():
+    cache_dir = os.environ.get("NUMBA_CACHE_DIR", NUMBA_CACHE_DIR)
+    return os.path.join(cache_dir, "warmup.done")
+
+
+def _wait_warmup():
+    """Wait until rank 0 has finished compiling. A NCCL barrier dies after 10 minutes."""
+    path = _warmup_marker()
+    # ponytail: 3h ceiling so a dead rank 0 does not hold the node until the job walltime
+    deadline = time.time() + 3 * 60 * 60
+    while not os.path.exists(path):
+        if time.time() >= deadline:
+            raise TimeoutError("Numba warmup did not finish: " + path)
+        time.sleep(5)
+
+
+def _mark_warmup():
+    path = _warmup_marker()
+    tmp = path + "." + str(os.getpid())
+    with open(tmp, "w") as fh:
+        fh.write("ok\n")
+    os.replace(tmp, path)
+
+
 def _crop_ops(size, scale, blur_p, solar_p):
     from ffcv.fields.decoders import RandomResizedCropRGBImageDecoder
     from ffcv.pipeline.operation import Operation
@@ -285,9 +310,10 @@ class IBotFFCVLoader:
         if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             world = torch.distributed.get_world_size()
-        # Rank 0 compiles and fills the cache. The others wait, then load it.
+        # Rank 0 compiles and fills the cache. The others poll a file, then load it.
+        # dist.barrier is an ALLREDUCE and the NCCL watchdog kills it after 10 minutes.
         if world > 1 and rank != 0:
-            torch.distributed.barrier()
+            _wait_warmup()
 
         if torch.cuda.is_available():
             device = torch.device('cuda', torch.cuda.current_device())
@@ -330,10 +356,8 @@ class IBotFFCVLoader:
             drop_last=True,
         )
         if world > 1 and rank == 0:
-            try:
-                _warm_one_batch(self.loader)
-            finally:
-                torch.distributed.barrier()
+            _warm_one_batch(self.loader)
+            _mark_warmup()
         self.num_samples = int(self.loader.reader.num_samples)
 
     def set_epoch(self, epoch):
@@ -395,7 +419,24 @@ def _check_closure_stamp():
     assert first.__qualname__ == again.__qualname__
 
 
+def _check_warmup_marker():
+    import tempfile
+    old = os.environ.get("NUMBA_CACHE_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["NUMBA_CACHE_DIR"] = tmp
+        try:
+            assert not os.path.exists(_warmup_marker())
+            _mark_warmup()
+            assert os.path.exists(_warmup_marker())
+        finally:
+            if old is None:
+                os.environ.pop("NUMBA_CACHE_DIR", None)
+            else:
+                os.environ["NUMBA_CACHE_DIR"] = old
+
+
 if __name__ == '__main__':
     _check_masks()
     _check_closure_stamp()
+    _check_warmup_marker()
     print('mask sampler ok')
