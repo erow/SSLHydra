@@ -173,6 +173,10 @@ def get_args_parser():
     return parser
 
 def train_ibot(args):
+    # Numba records builtins.print at import. init_distributed_mode replaces
+    # print afterwards, and a later FFCV import then crashes inside Numba.
+    if args.data_path.endswith('.ffcv'):
+        import numba  # noqa: F401
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
