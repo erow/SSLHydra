@@ -17,8 +17,20 @@ from torchvision.datasets import ImageFolder
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255
 IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255
-# Shared across nodes. Node /tmp is invisible to the next job.
-NUMBA_CACHE_DIR = "/scratch/project_465003400/cache/numba"
+
+
+def _numba_cache_dir():
+    """Node-local Numba cache. Lustre file locks hang the compile."""
+    path = os.environ.get("NUMBA_CACHE_LOCAL")
+    if not path:
+        job = os.environ.get("SLURM_JOB_ID", "local")
+        path = f"/tmp/numba-ffcv-{job}"
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _local_rank():
+    return int(os.environ.get("LOCAL_RANK", "0"))
 
 class ImageFolderInstance(ImageFolder):
     def __getitem__(self, index):
@@ -177,15 +189,15 @@ def _stamp_closure(fn):
 
 
 def _enable_ffcv_numba_cache():
-    """Compile FFCV's Numba stages once and reuse them from NUMBA_CACHE_DIR."""
-    os.environ.setdefault("NUMBA_CACHE_DIR", NUMBA_CACHE_DIR)
-    os.makedirs(os.environ["NUMBA_CACHE_DIR"], exist_ok=True)
+    """Compile FFCV's Numba stages once and reuse them from this node's /tmp."""
+    cache_dir = _numba_cache_dir()
+    os.environ["NUMBA_CACHE_DIR"] = cache_dir
     import numba
     from numba import njit
     from ffcv.pipeline.compiler import Compiler
 
     # train_ibot imports numba before this runs, so the env var alone is too late.
-    numba.config.CACHE_DIR = os.environ["NUMBA_CACHE_DIR"]
+    numba.config.CACHE_DIR = cache_dir
     if getattr(Compiler, "_cache_patched", False):
         return
 
@@ -210,13 +222,18 @@ def _warm_one_batch(loader):
     try:
         next(it)
     finally:
-        it.close()
+        # Stop the worker before tearing down its memory. close() drops the
+        # cache while the thread may still be inside the pipeline.
+        it.terminate_event.set()
         it.join(timeout=300)
+        alive = it.is_alive()
+        it.close()
+        if alive:
+            raise RuntimeError("FFCV warmup thread did not stop")
 
 
 def _warmup_marker():
-    cache_dir = os.environ.get("NUMBA_CACHE_DIR", NUMBA_CACHE_DIR)
-    return os.path.join(cache_dir, "warmup.done")
+    return os.path.join(_numba_cache_dir(), "warmup.done")
 
 
 def _wait_warmup():
@@ -306,13 +323,15 @@ class IBotFFCVLoader:
         from ffcv.transforms.ops import View
 
         _enable_ffcv_numba_cache()
-        rank, world = 0, 1
+        
         if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
             world = torch.distributed.get_world_size()
-        # Rank 0 compiles and fills the cache. The others poll a file, then load it.
+        else:
+            world = 1
+        # Local rank 0 compiles into this node's /tmp. The others poll a file.
+        # A global rank is wrong here: another node's /tmp is invisible.
         # dist.barrier is an ALLREDUCE and the NCCL watchdog kills it after 10 minutes.
-        if world > 1 and rank != 0:
+        if world > 1 and _local_rank() != 0:
             _wait_warmup()
 
         if torch.cuda.is_available():
@@ -355,8 +374,12 @@ class IBotFFCVLoader:
             pipelines=pipelines,
             drop_last=True,
         )
-        if world > 1 and rank == 0:
+        if world > 1 and _local_rank() == 0:
+            epoch = self.loader.next_epoch
             _warm_one_batch(self.loader)
+            # The warmup batch advances next_epoch. Training sets it again,
+            # but a caller that does not would walk a different order than its peers.
+            self.loader.next_epoch = epoch
             _mark_warmup()
         self.num_samples = int(self.loader.reader.num_samples)
 
@@ -421,18 +444,20 @@ def _check_closure_stamp():
 
 def _check_warmup_marker():
     import tempfile
-    old = os.environ.get("NUMBA_CACHE_DIR")
+    old = os.environ.get("NUMBA_CACHE_LOCAL")
     with tempfile.TemporaryDirectory() as tmp:
-        os.environ["NUMBA_CACHE_DIR"] = tmp
+        os.environ["NUMBA_CACHE_LOCAL"] = tmp
         try:
+            assert _numba_cache_dir() == tmp
             assert not os.path.exists(_warmup_marker())
             _mark_warmup()
             assert os.path.exists(_warmup_marker())
+            assert _warmup_marker().startswith(tmp)
         finally:
             if old is None:
-                os.environ.pop("NUMBA_CACHE_DIR", None)
+                os.environ.pop("NUMBA_CACHE_LOCAL", None)
             else:
-                os.environ["NUMBA_CACHE_DIR"] = old
+                os.environ["NUMBA_CACHE_LOCAL"] = old
 
 
 if __name__ == '__main__':
