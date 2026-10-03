@@ -4,8 +4,11 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import random
+import hashlib
 import math
+import os
+import random
+
 import numpy as np
 import torch
 
@@ -13,6 +16,8 @@ from torchvision.datasets import ImageFolder
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255
 IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255
+# Shared across nodes. Node /tmp is invisible to the next job.
+NUMBA_CACHE_DIR = "/scratch/project_465003400/cache/numba"
 
 class ImageFolderInstance(ImageFolder):
     def __getitem__(self, index):
@@ -139,6 +144,75 @@ class ImageFolderMask(ImageFolder):
         return output + (masks,)
 
 
+def _cell_token(value):
+    if isinstance(value, (int, float, str, bool, type(None))):
+        return repr(value)
+    if isinstance(value, tuple) and all(
+            isinstance(x, (int, float, str, bool, type(None))) for x in value):
+        return repr(value)
+    if isinstance(value, np.ndarray):
+        return repr((str(value.dtype), value.shape, np.round(value, 6).tolist()))
+    py = getattr(value, "py_func", None)
+    if py is not None:
+        return "njit:" + getattr(py, "__qualname__", py.__name__)
+    if callable(value):
+        return "fn:" + getattr(value, "__qualname__", type(value).__name__)
+    return type(value).__name__ + ":" + repr(value)
+
+
+def _stamp_closure(fn):
+    """Put closed-over crop settings into the qualname Numba uses as its cache key.
+
+    Numba keys a cached function by source and qualname, not by closure cells.
+    Two decoders that share one nested function and close over different scales
+    would otherwise load each other's machine code.
+    """
+    cells = fn.__closure__
+    if not cells:
+        return
+    token = "|".join(_cell_token(cell.cell_contents) for cell in cells)
+    digest = hashlib.sha1(token.encode()).hexdigest()[:16]
+    fn.__qualname__ = fn.__qualname__ + "." + digest
+
+
+def _enable_ffcv_numba_cache():
+    """Compile FFCV's Numba stages once and reuse them from NUMBA_CACHE_DIR."""
+    os.environ.setdefault("NUMBA_CACHE_DIR", NUMBA_CACHE_DIR)
+    os.makedirs(os.environ["NUMBA_CACHE_DIR"], exist_ok=True)
+    import numba
+    from numba import njit
+    from ffcv.pipeline.compiler import Compiler
+
+    # train_ibot imports numba before this runs, so the env var alone is too late.
+    numba.config.CACHE_DIR = os.environ["NUMBA_CACHE_DIR"]
+    if getattr(Compiler, "_cache_patched", False):
+        return
+
+    @classmethod
+    def compile(cls, code, signature=None):
+        parallel = False
+        if hasattr(code, "is_parallel"):
+            parallel = code.is_parallel and cls.num_threads > 1
+        if not cls.is_enabled:
+            return code
+        _stamp_closure(code)
+        return njit(signature, fastmath=True, nogil=True, error_model="numpy",
+                    parallel=parallel, cache=True)(code)
+
+    Compiler.compile = compile
+    Compiler._cache_patched = True
+
+
+def _warm_one_batch(loader):
+    """Run one batch so this process writes the Numba cache before its peers compile."""
+    it = iter(loader)
+    try:
+        next(it)
+    finally:
+        it.close()
+        it.join(timeout=300)
+
+
 def _crop_ops(size, scale, blur_p, solar_p):
     from ffcv.fields.decoders import RandomResizedCropRGBImageDecoder
     from ffcv.pipeline.operation import Operation
@@ -206,6 +280,15 @@ class IBotFFCVLoader:
         from ffcv.transforms import ToDevice, ToTensor
         from ffcv.transforms.ops import View
 
+        _enable_ffcv_numba_cache()
+        rank, world = 0, 1
+        if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world = torch.distributed.get_world_size()
+        # Rank 0 compiles and fills the cache. The others wait, then load it.
+        if world > 1 and rank != 0:
+            torch.distributed.barrier()
+
         if torch.cuda.is_available():
             device = torch.device('cuda', torch.cuda.current_device())
         else:
@@ -246,6 +329,11 @@ class IBotFFCVLoader:
             pipelines=pipelines,
             drop_last=True,
         )
+        if world > 1 and rank == 0:
+            try:
+                _warm_one_batch(self.loader)
+            finally:
+                torch.distributed.barrier()
         self.num_samples = int(self.loader.reader.num_samples)
 
     def set_epoch(self, epoch):
@@ -291,6 +379,23 @@ def _check_masks():
     assert not held.batch(2, 8, 8).any()
 
 
+def _check_closure_stamp():
+    def make(scale):
+        def decode(x):
+            return x + scale
+        return decode
+
+    first = make((0.14, 1.0))
+    second = make((0.05, 0.4))
+    again = make((0.14, 1.0))
+    _stamp_closure(first)
+    _stamp_closure(second)
+    _stamp_closure(again)
+    assert first.__qualname__ != second.__qualname__
+    assert first.__qualname__ == again.__qualname__
+
+
 if __name__ == '__main__':
     _check_masks()
+    _check_closure_stamp()
     print('mask sampler ok')
