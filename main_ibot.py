@@ -334,7 +334,7 @@ def train_ibot(args):
 
     if utils.is_main_process(): # Tensorboard configuration
         local_runs = os.path.join(args.output_dir, 'tf_logs')
-        writer = SummaryWriter(logdir=local_runs)
+        writer = SummaryWriter(log_dir=local_runs)
         if not args.no_wandb:
             import wandb
             os.environ.setdefault("WANDB_START_METHOD", "thread")
