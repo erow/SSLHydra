@@ -24,10 +24,12 @@ from pathlib import Path
 from PIL import Image
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from models.head import iBOTHead
-from loader import ImageFolderMask
+from loader import IBotFFCVLoader, ImageFolderMask
 from evaluation.unsupervised.unsup_cls import eval_pred
+from fused_gated_contrast import fused_gated_contrast
+from simlap import gather_with_grad
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -109,6 +111,8 @@ def get_args_parser():
     parser.add_argument('--batch_size_per_gpu', default=128, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
+    parser.add_argument('--max_steps', default=0, type=int,
+        help='Stop each epoch after this many steps. 0 runs the full epoch.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
@@ -139,8 +143,9 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
-    parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
-        help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--data_path',
+        default='/scratch/project_465003400/datasets/ffcv/IN1K_train_smart500_q90.ffcv', type=str,
+        help='ImageNet train folder, or an FFCV .ffcv file.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=40, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -148,9 +153,32 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+
+    parser.add_argument('--loss', default='both', choices=['ibot', 'hydra', 'both'],
+        help='Train the iBOT loss, the Hydra loss, or the sum of both.')
+    # Hydra: gated InfoNCE on teacher-chosen partners. See docs/hydra.md.
+    parser.add_argument('--teacher_cls', default=(
+        '/scratch/project_465003400/SSLHydra/outputs/imagenet_teacher_cls_ffcv/train_teacher_cls.npy'),
+        type=str, help='Memmap of frozen iBOT teacher [CLS] vectors, row = FFCV index.')
+    parser.add_argument('--hydra_tau', default=0.1, type=float,
+        help='Softmax temperature for teacher-similarity partner sampling.')
+    parser.add_argument('--hydra_temperature', default=0.1, type=float,
+        help='InfoNCE temperature. Distinct from --hydra_tau.')
+    parser.add_argument('--hydra_k', default=1, type=int,
+        help='Number of partner draws / subspaces averaged into loss_hydra.')
+    parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand'],
+        help='Partner index: teacher similarity, or uniform over the other rows.')
+    parser.add_argument('--hydra_mlp_dim', default=1024, type=int,
+        help='Hidden width of the gate MLP.')
+    parser.add_argument('--hydra_weight', default=1.0, type=float,
+        help='Multiplier on loss_hydra when --loss is hydra or both.')
     return parser
 
 def train_ibot(args):
+    # Numba records builtins.print at import. init_distributed_mode replaces
+    # print afterwards, and a later FFCV import then crashes inside Numba.
+    if args.data_path.endswith('.ffcv'):
+        import numba  # noqa: F401
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -158,32 +186,51 @@ def train_ibot(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    transform = DataAugmentationiBOT(
-        args.global_crops_scale,
-        args.local_crops_scale,
-        args.global_crops_number,
-        args.local_crops_number,
-    )
     pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
-    dataset = ImageFolderMask(
-        args.data_path, 
-        transform=transform,
-        patch_size=pred_size,
+    mask_kwargs = dict(
         pred_ratio=args.pred_ratio,
         pred_ratio_var=args.pred_ratio_var,
         pred_aspect_ratio=(0.3, 1/0.3),
         pred_shape=args.pred_shape,
-        pred_start_epoch=args.pred_start_epoch)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        sampler=sampler,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
+        pred_start_epoch=args.pred_start_epoch,
     )
-    print(f"Data loaded: there are {len(dataset)} images.")
+    if args.data_path.endswith('.ffcv'):
+        data_loader = IBotFFCVLoader(
+            args.data_path,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=args.num_workers,
+            global_crops_scale=args.global_crops_scale,
+            local_crops_scale=args.local_crops_scale,
+            global_crops_number=args.global_crops_number,
+            local_crops_number=args.local_crops_number,
+            patch_size=pred_size,
+            distributed=utils.get_world_size() > 1,
+            seed=args.seed,
+            **mask_kwargs,
+        )
+        print(f"Data loaded: there are {data_loader.num_samples} images.")
+    else:
+        transform = DataAugmentationiBOT(
+            args.global_crops_scale,
+            args.local_crops_scale,
+            args.global_crops_number,
+            args.local_crops_number,
+        )
+        dataset = ImageFolderMask(
+            args.data_path,
+            transform=transform,
+            patch_size=pred_size,
+            **mask_kwargs)
+        sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            sampler=sampler,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -288,8 +335,28 @@ def train_ibot(args):
         local_runs = os.path.join(args.output_dir, 'tf_logs')
         writer = SummaryWriter(logdir=local_runs)
         
+    # ============ Hydra gate + frozen teacher table ... ============
+    use_hydra = args.loss in ('hydra', 'both')
+    if use_hydra:
+        teacher_table = TeacherTable(args.teacher_cls)
+        hydra = Hydra(
+            teacher_table.dim,
+            args.out_dim,
+            args.hydra_mlp_dim,
+            args.hydra_temperature,
+            args.hydra_tau,
+            args.hydra_k,
+            args.hydra_pair,
+        ).cuda()
+        hydra = nn.parallel.DistributedDataParallel(hydra, device_ids=[args.gpu])
+    else:
+        teacher_table = None
+        hydra = None
+
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
+    if hydra is not None:
+        params_groups = _merge_param_groups(params_groups, utils.get_params_groups(hydra))
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
     elif args.optimizer == "sgd":
@@ -322,14 +389,19 @@ def train_ibot(args):
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
     if args.load_from:
-        utils.restart_from_checkpoint(
-            os.path.join(args.output_dir, args.load_from),
-            run_variables=to_restore,
+        ckpt_kwargs = dict(
             student=student,
             teacher=teacher,
             optimizer=optimizer,
             fp16_scaler=fp16_scaler,
             ibot_loss=ibot_loss,
+        )
+        if hydra is not None:
+            ckpt_kwargs['hydra'] = hydra
+        utils.restart_from_checkpoint(
+            os.path.join(args.output_dir, args.load_from),
+            run_variables=to_restore,
+            **ckpt_kwargs,
         )
     start_epoch = to_restore["epoch"]
 
@@ -342,7 +414,7 @@ def train_ibot(args):
         # ============ training one epoch of iBOT ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, args)
+            epoch, fp16_scaler, hydra, teacher_table, args)
 
         # ============ writing logs ... ============
         save_dict = {
@@ -353,6 +425,8 @@ def train_ibot(args):
             'args': args,
             'ibot_loss': ibot_loss.state_dict(),
         }
+        if hydra is not None:
+            save_dict['hydra'] = hydra.state_dict()
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
@@ -373,7 +447,7 @@ def train_ibot(args):
 
 def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
-                    fp16_scaler, args):
+                    fp16_scaler, hydra, teacher_table, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     
@@ -390,9 +464,14 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     params_k = [param_k for name_k, param_k in zip(names_k, params_k) if name_k in names_common]
 
     pred_labels, real_labels = [], []
-    for it, (images, labels, masks) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for local_it, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
+        if len(batch) == 4:
+            images, labels, masks, idx = batch
+        else:
+            images, labels, masks = batch
+            idx = None
         # update weight decay and learning rate according to their schedule
-        it = len(data_loader) * epoch + it  # global training iteration
+        it = len(data_loader) * epoch + local_it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
@@ -412,8 +491,21 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             student_local_cls = student(images[args.global_crops_number:])[0] if len(images) > args.global_crops_number else None
             student.module.backbone.masked_im_modeling = args.use_masked_im_modeling
 
-            all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
-            loss = all_loss.pop('loss')
+            all_loss = {}
+            loss = None
+            if args.loss in ('ibot', 'both'):
+                all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
+                loss = all_loss.pop('loss')
+            if args.loss in ('hydra', 'both'):
+                if idx is None:
+                    raise RuntimeError("Hydra needs the FFCV sample index; use an .ffcv data_path")
+                b = labels.shape[0]
+                # First global crop: one latent per image. Student and momentum teacher.
+                t_p = teacher_table.take(idx).cuda(non_blocking=True)
+                loss_hydra = hydra(student_output[0][:b], teacher_output[0][:b], t_p)
+                all_loss['hydra'] = loss_hydra
+                term = args.hydra_weight * loss_hydra
+                loss = term if loss is None else loss + term
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -435,6 +527,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             loss.backward()
             if args.clip_grad:
                 param_norms = utils.clip_gradients(student, args.clip_grad)
+                if hydra is not None:
+                    utils.clip_gradients(hydra, args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             optimizer.step()
@@ -443,6 +537,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             if args.clip_grad:
                 fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 param_norms = utils.clip_gradients(student, args.clip_grad)
+                if hydra is not None:
+                    utils.clip_gradients(hydra, args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             fp16_scaler.step(optimizer)
@@ -462,6 +558,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
         metric_logger.update(acc=acc)
+        if args.max_steps and local_it + 1 >= args.max_steps:
+            break
 
     pred_labels = torch.cat(pred_labels).cpu().detach().numpy()
     real_labels = torch.cat(real_labels).cpu().detach().numpy()
@@ -473,6 +571,118 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     return_dict.update({"nmi": nmi, "ari": ari, "fscore": fscore, "adjacc": adjacc})
     return return_dict
+
+
+def _merge_param_groups(student_groups, hydra_groups):
+    """Keep the iBOT split: group 0 follows the weight-decay schedule."""
+    return [
+        {'params': student_groups[0]['params'] + hydra_groups[0]['params']},
+        {'params': student_groups[1]['params'] + hydra_groups[1]['params'], 'weight_decay': 0.},
+    ]
+
+
+class TeacherTable:
+    """CPU memmap of frozen teacher vectors. Copies one batch per step."""
+
+    def __init__(self, path):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        self.table = np.load(path, mmap_mode='r')
+        self.dim = int(self.table.shape[1])
+
+    def take(self, idx):
+        rows = np.asarray(self.table[idx.numpy()], dtype=np.float32)
+        return torch.from_numpy(rows)
+
+
+def sample_partner(t_p, strategy, tau):
+    """Partner index inside the local batch. Never the row itself."""
+    b = t_p.shape[0]
+    if b < 2:
+        raise RuntimeError(f"Hydra partner sampling needs batch size >= 2, got {b}")
+    if strategy == 'rand':
+        t_idx = torch.randint(0, b - 1, (b,), device=t_p.device)
+        arange = torch.arange(b, device=t_p.device)
+        return t_idx + (t_idx >= arange).long()
+    u = F.normalize(t_p, dim=-1)
+    m = u @ u.T
+    m = m.masked_fill(torch.eye(b, dtype=torch.bool, device=t_p.device), float('-inf'))
+    return torch.multinomial(torch.softmax(m / tau, dim=-1), 1).squeeze(1)
+
+
+class Hydra(nn.Module):
+    """Gate from the averaged teacher pair, then K gated InfoNCE steps."""
+
+    def __init__(self, teacher_dim, embed_dim, mlp_dim, temperature, tau, k, strategy):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(teacher_dim, mlp_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(mlp_dim, embed_dim),
+        )
+        self.temperature = temperature
+        self.tau = tau
+        self.k = k
+        self.strategy = strategy
+
+    def forward(self, z_s, z_t, t_p):
+        same = z_s is z_t
+        z_t = z_t.detach()
+        t_p = t_p.detach()
+        keys = gather_with_grad(z_t)
+        b = z_s.shape[0]
+        offset = utils.get_rank() * b
+        total = 0
+        for _ in range(self.k):
+            with torch.no_grad():
+                t_idx = sample_partner(t_p, self.strategy, self.tau)
+            pair = (t_p + t_p[t_idx]) * 0.5
+            gate = self.gate(pair).sigmoid()
+            logits = fused_gated_contrast(z_s, keys, gate) / self.temperature
+            if same:
+                rows = torch.arange(b, device=logits.device)
+                logits = logits.clone()
+                logits[rows, rows + offset] = float('-inf')
+            total = total + F.cross_entropy(logits, t_idx + offset)
+        return total / self.k
+
+
+def _check_hydra():
+    torch.manual_seed(0)
+    b, d, c = 4, 8, 6
+    t_p = torch.tensor([
+        [1., 0., 0., 0., 0., 0.],
+        [0.9, 0.1, 0., 0., 0., 0.],
+        [0., 0., 1., 0., 0., 0.],
+        [0., 0., 0., 1., 0., 0.],
+    ])
+    u = F.normalize(t_p, dim=-1)
+    m = u @ u.T
+    m = m.masked_fill(torch.eye(b, dtype=torch.bool), float('-inf'))
+    assert int(torch.softmax(m / 1e-3, dim=-1)[0].argmax()) == 1
+    for _ in range(20):
+        drawn = sample_partner(t_p, 'rand', 0.1)
+        assert not torch.equal(drawn, torch.arange(b))
+        assert int((drawn == torch.arange(b)).sum()) == 0
+    hydra = Hydra(c, d, 16, temperature=0.2, tau=0.1, k=1, strategy='rand')
+    z_s = torch.randn(b, d, requires_grad=True)
+    z_t = torch.randn(b, d)
+    torch.manual_seed(1)
+    loss = hydra(z_s, z_t, t_p)
+    torch.manual_seed(1)
+    t_idx = sample_partner(t_p, 'rand', 0.1)
+    gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
+    ref = F.cross_entropy(fused_gated_contrast(z_s, z_t, gate) / 0.2, t_idx)
+    assert torch.allclose(loss, ref), (float(loss), float(ref))
+    loss.backward()
+    assert z_s.grad is not None and float(z_s.grad.abs().sum()) > 0
+    assert hydra.gate[0].weight.grad is not None
+    assert t_p.grad is None
+    z = torch.randn(b, d, requires_grad=True)
+    same = hydra(z, z, t_p)
+    same.backward()
+    assert math.isfinite(float(same.detach()))
+    print('hydra ok', float(loss))
 
 
 class iBOTLoss(nn.Module):
