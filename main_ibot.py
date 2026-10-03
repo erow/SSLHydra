@@ -154,6 +154,8 @@ def get_args_parser():
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
 
+    parser.add_argument('--loss', default='both', choices=['ibot', 'hydra', 'both'],
+        help='Train the iBOT loss, the Hydra loss, or the sum of both.')
     # Hydra: gated InfoNCE on teacher-chosen partners. See docs/hydra.md.
     parser.add_argument('--teacher_cls', default=(
         '/scratch/project_465003400/SSLHydra/outputs/imagenet_teacher_cls_ffcv/train_teacher_cls.npy'),
@@ -169,7 +171,7 @@ def get_args_parser():
     parser.add_argument('--hydra_mlp_dim', default=1024, type=int,
         help='Hidden width of the gate MLP.')
     parser.add_argument('--hydra_weight', default=1.0, type=float,
-        help='Weight of loss_hydra added to the iBOT loss.')
+        help='Multiplier on loss_hydra when --loss is hydra or both.')
     return parser
 
 def train_ibot(args):
@@ -334,21 +336,27 @@ def train_ibot(args):
         writer = SummaryWriter(logdir=local_runs)
         
     # ============ Hydra gate + frozen teacher table ... ============
-    teacher_table = TeacherTable(args.teacher_cls)
-    hydra = Hydra(
-        teacher_table.dim,
-        args.out_dim,
-        args.hydra_mlp_dim,
-        args.hydra_temperature,
-        args.hydra_tau,
-        args.hydra_k,
-        args.hydra_pair,
-    ).cuda()
-    hydra = nn.parallel.DistributedDataParallel(hydra, device_ids=[args.gpu])
+    use_hydra = args.loss in ('hydra', 'both')
+    if use_hydra:
+        teacher_table = TeacherTable(args.teacher_cls)
+        hydra = Hydra(
+            teacher_table.dim,
+            args.out_dim,
+            args.hydra_mlp_dim,
+            args.hydra_temperature,
+            args.hydra_tau,
+            args.hydra_k,
+            args.hydra_pair,
+        ).cuda()
+        hydra = nn.parallel.DistributedDataParallel(hydra, device_ids=[args.gpu])
+    else:
+        teacher_table = None
+        hydra = None
 
     # ============ preparing optimizer ... ============
-    params_groups = _merge_param_groups(
-        utils.get_params_groups(student), utils.get_params_groups(hydra))
+    params_groups = utils.get_params_groups(student)
+    if hydra is not None:
+        params_groups = _merge_param_groups(params_groups, utils.get_params_groups(hydra))
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
     elif args.optimizer == "sgd":
@@ -381,15 +389,19 @@ def train_ibot(args):
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
     if args.load_from:
-        utils.restart_from_checkpoint(
-            os.path.join(args.output_dir, args.load_from),
-            run_variables=to_restore,
+        ckpt_kwargs = dict(
             student=student,
             teacher=teacher,
             optimizer=optimizer,
             fp16_scaler=fp16_scaler,
             ibot_loss=ibot_loss,
-            hydra=hydra,
+        )
+        if hydra is not None:
+            ckpt_kwargs['hydra'] = hydra
+        utils.restart_from_checkpoint(
+            os.path.join(args.output_dir, args.load_from),
+            run_variables=to_restore,
+            **ckpt_kwargs,
         )
     start_epoch = to_restore["epoch"]
 
@@ -412,8 +424,9 @@ def train_ibot(args):
             'epoch': epoch + 1,
             'args': args,
             'ibot_loss': ibot_loss.state_dict(),
-            'hydra': hydra.state_dict(),
         }
+        if hydra is not None:
+            save_dict['hydra'] = hydra.state_dict()
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
@@ -478,16 +491,21 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             student_local_cls = student(images[args.global_crops_number:])[0] if len(images) > args.global_crops_number else None
             student.module.backbone.masked_im_modeling = args.use_masked_im_modeling
 
-            all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
-            loss = all_loss.pop('loss')
-            if idx is None:
-                raise RuntimeError("Hydra needs the FFCV sample index; use an .ffcv data_path")
-            b = labels.shape[0]
-            # First global crop: one latent per image. Student and momentum teacher.
-            t_p = teacher_table.take(idx).cuda(non_blocking=True)
-            loss_hydra = hydra(student_output[0][:b], teacher_output[0][:b], t_p)
-            all_loss['hydra'] = loss_hydra
-            loss = loss + args.hydra_weight * loss_hydra
+            all_loss = {}
+            loss = None
+            if args.loss in ('ibot', 'both'):
+                all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
+                loss = all_loss.pop('loss')
+            if args.loss in ('hydra', 'both'):
+                if idx is None:
+                    raise RuntimeError("Hydra needs the FFCV sample index; use an .ffcv data_path")
+                b = labels.shape[0]
+                # First global crop: one latent per image. Student and momentum teacher.
+                t_p = teacher_table.take(idx).cuda(non_blocking=True)
+                loss_hydra = hydra(student_output[0][:b], teacher_output[0][:b], t_p)
+                all_loss['hydra'] = loss_hydra
+                term = args.hydra_weight * loss_hydra
+                loss = term if loss is None else loss + term
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -509,7 +527,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             loss.backward()
             if args.clip_grad:
                 param_norms = utils.clip_gradients(student, args.clip_grad)
-                utils.clip_gradients(hydra, args.clip_grad)
+                if hydra is not None:
+                    utils.clip_gradients(hydra, args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             optimizer.step()
@@ -518,7 +537,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             if args.clip_grad:
                 fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 param_norms = utils.clip_gradients(student, args.clip_grad)
-                utils.clip_gradients(hydra, args.clip_grad)
+                if hydra is not None:
+                    utils.clip_gradients(hydra, args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             fp16_scaler.step(optimizer)
