@@ -147,6 +147,7 @@ def get_args_parser():
         default='/scratch/project_465003400/datasets/ffcv/IN1K_train_smart500_q90.ffcv', type=str,
         help='ImageNet train folder, or an FFCV .ffcv file.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
+    parser.add_argument('--no-wandb', action='store_true', help='Skip Weights & Biases. Rank 0 logs otherwise.')
     parser.add_argument('--saveckp_freq', default=40, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=8, type=int, help='Number of data loading workers per GPU.')
@@ -334,6 +335,16 @@ def train_ibot(args):
     if utils.is_main_process(): # Tensorboard configuration
         local_runs = os.path.join(args.output_dir, 'tf_logs')
         writer = SummaryWriter(logdir=local_runs)
+        if not args.no_wandb:
+            import wandb
+            os.environ.setdefault("WANDB_START_METHOD", "thread")
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "SSLHydra"),
+                entity=os.environ.get("WANDB_ENTITY") or None,
+                name=os.environ.get("WANDB_NAME") or os.environ.get("SLURM_JOB_NAME") or Path(args.output_dir).name,
+                dir=args.output_dir,
+                config=vars(args),
+            )
         
     # ============ Hydra gate + frozen teacher table ... ============
     use_hydra = args.loss in ('hydra', 'both')
@@ -439,7 +450,12 @@ def train_ibot(args):
                 f.write(json.dumps(log_stats) + "\n")
                 for k, v in train_stats.items():
                     writer.add_scalar(k, v, epoch)
-        
+                if not args.no_wandb:
+                    wandb.log(train_stats, step=epoch)
+
+    if utils.is_main_process() and not args.no_wandb:
+        wandb.finish()
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
