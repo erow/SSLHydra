@@ -32,6 +32,32 @@ def _numba_cache_dir():
 def _local_rank():
     return int(os.environ.get("LOCAL_RANK", "0"))
 
+# Numba reads the cache directory at import. A later assignment does not move it.
+os.environ["NUMBA_CACHE_DIR"] = _numba_cache_dir()
+
+import numba
+from numba import njit
+from dataclasses import replace
+
+import cv2
+
+numba.config.CACHE_DIR = os.environ["NUMBA_CACHE_DIR"]
+
+from ffcv.fields.decoders import IntDecoder, RandomResizedCropRGBImageDecoder
+from ffcv.loader import Loader, OrderOption
+from ffcv.pipeline import PipelineSpec
+from ffcv.pipeline.compiler import Compiler
+from ffcv.pipeline.operation import Operation
+from ffcv.pipeline.state import State
+from ffcv.reader import Reader
+from ffcv.transforms import (
+    NormalizeImage, RandomHorizontalFlip, ToDevice, ToTensor, ToTorchImage,
+)
+from ffcv.transforms.color_jitter import RandomColorJitter
+from ffcv.transforms.grayscale import RandomGrayscale
+from ffcv.transforms.ops import View
+from ffcv.transforms.solarization import RandomSolarization
+
 class ImageFolderInstance(ImageFolder):
     def __getitem__(self, index):
         img, target = super(ImageFolderInstance, self).__getitem__(index)
@@ -190,14 +216,7 @@ def _stamp_closure(fn):
 
 def _enable_ffcv_numba_cache():
     """Compile FFCV's Numba stages once and reuse them from this node's /tmp."""
-    cache_dir = _numba_cache_dir()
-    os.environ["NUMBA_CACHE_DIR"] = cache_dir
-    import numba
-    from numba import njit
-    from ffcv.pipeline.compiler import Compiler
-
-    # train_ibot imports numba before this runs, so the env var alone is too late.
-    numba.config.CACHE_DIR = cache_dir
+    numba.config.CACHE_DIR = os.environ["NUMBA_CACHE_DIR"]
     if getattr(Compiler, "_cache_patched", False):
         return
 
@@ -256,16 +275,6 @@ def _mark_warmup():
 
 
 def _crop_ops(size, scale, blur_p, solar_p):
-    from ffcv.fields.decoders import RandomResizedCropRGBImageDecoder
-    from ffcv.pipeline.operation import Operation
-    from ffcv.pipeline.state import State
-    from ffcv.transforms import RandomHorizontalFlip
-    from ffcv.transforms.color_jitter import RandomColorJitter
-    from ffcv.transforms.grayscale import RandomGrayscale
-    from ffcv.transforms.solarization import RandomSolarization
-    from dataclasses import replace
-    import cv2
-
     class CvBlur(Operation):
         def __init__(self, p):
             super().__init__()
@@ -300,7 +309,6 @@ def _crop_ops(size, scale, blur_p, solar_p):
 
 
 def _normalize_ops(device):
-    from ffcv.transforms import NormalizeImage, ToDevice, ToTensor, ToTorchImage
     return [
         NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),
         ToTensor(),
@@ -315,13 +323,6 @@ class IBotFFCVLoader:
     def __init__(self, fname, batch_size, num_workers, global_crops_scale, local_crops_scale,
                  global_crops_number, local_crops_number, patch_size, pred_ratio, pred_ratio_var,
                  pred_aspect_ratio, pred_shape, pred_start_epoch, distributed, seed):
-        from ffcv.fields.decoders import IntDecoder
-        from ffcv.loader import Loader, OrderOption
-        from ffcv.pipeline import PipelineSpec
-        from ffcv.reader import Reader
-        from ffcv.transforms import ToDevice, ToTensor
-        from ffcv.transforms.ops import View
-
         _enable_ffcv_numba_cache()
         
         if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
