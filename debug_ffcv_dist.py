@@ -1,7 +1,6 @@
 """Two ranks, one GPU: IBotFFCVLoader shards the val beton and the indices agree.
 
-Gloo owns the process group so both ranks can share the single visible GPU.
-NCCL would bind LOCAL_RANK to a device that is not there.
+Both ranks use cuda:0. There is one GPU, so NCCL must not follow LOCAL_RANK.
 """
 import os
 
@@ -19,12 +18,18 @@ BATCHES = 2
 
 
 def main():
-    dist.init_process_group(backend="gloo")
+    if not torch.cuda.is_available():
+        raise SystemExit("nccl needs a GPU")
+    torch.cuda.set_device(0)
+    print(
+        f"rank {os.environ.get('RANK', '?')} init nccl "
+        f"cuda_devices={torch.cuda.device_count()}",
+        flush=True,
+    )
+    dist.init_process_group(backend="nccl", device_id=torch.device("cuda:0"))
     rank = dist.get_rank()
     world = dist.get_world_size()
-    if torch.cuda.is_available():
-        torch.cuda.set_device(0)
-    print(f"rank {rank}/{world} cuda_devices={torch.cuda.device_count()}", flush=True)
+    print(f"rank {rank}/{world} nccl up", flush=True)
 
     loader = IBotFFCVLoader(
         VAL,
@@ -62,7 +67,7 @@ def main():
             flush=True,
         )
 
-    mine = torch.cat(seen)
+    mine = torch.cat(seen).to(device="cuda", dtype=torch.int64)
     gathered = [torch.zeros_like(mine) for _ in range(world)]
     dist.all_gather(gathered, mine)
     if rank == 0:
