@@ -305,8 +305,10 @@ def train_ibot(args):
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], broadcast_buffers=False) if \
-        'swin' in args.arch else nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    # Hydra uses the [CLS] head only, so the patch-token parameters get no gradient.
+    student = nn.parallel.DistributedDataParallel(
+        student, device_ids=[args.gpu], broadcast_buffers='swin' not in args.arch,
+        find_unused_parameters=(args.loss == 'hydra'))
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
     # there is no backpropagation through the teacher, so no need for gradients
