@@ -1,6 +1,6 @@
-"""Two ranks, one GPU: IBotFFCVLoader shards the val beton and the indices agree.
+"""Two ranks: IBotFFCVLoader shards the val beton and the indices agree.
 
-Both ranks use cuda:0. There is one GPU, so NCCL must not follow LOCAL_RANK.
+NCCL needs one GPU per rank. Each rank uses its LOCAL_RANK device.
 """
 import os
 
@@ -20,13 +20,15 @@ BATCHES = 2
 def main():
     if not torch.cuda.is_available():
         raise SystemExit("nccl needs a GPU")
-    torch.cuda.set_device(0)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
     print(
-        f"rank {os.environ.get('RANK', '?')} init nccl "
+        f"rank {os.environ.get('RANK', '?')} init nccl device={device} "
         f"cuda_devices={torch.cuda.device_count()}",
         flush=True,
     )
-    dist.init_process_group(backend="nccl", device_id=torch.device("cuda:0"))
+    dist.init_process_group(backend="nccl", device_id=device)
     rank = dist.get_rank()
     world = dist.get_world_size()
     print(f"rank {rank}/{world} nccl up", flush=True)
