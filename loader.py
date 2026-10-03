@@ -4,59 +4,36 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import hashlib
 import math
-import os
 import random
-import time
+from multiprocessing import cpu_count
+from typing import Mapping, Sequence, Type, Union
 
 import numpy as np
 import torch
-
+import torchvision.transforms.v2 as tfms
+from torch import nn
 from torchvision.datasets import ImageFolder
 
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255
-IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255
-
-
-def _numba_cache_dir():
-    """Node-local Numba cache. Lustre file locks hang the compile."""
-    path = os.environ.get("NUMBA_CACHE_LOCAL")
-    if not path:
-        job = os.environ.get("SLURM_JOB_ID", "local")
-        path = f"/tmp/numba-ffcv-{job}"
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def _local_rank():
-    return int(os.environ.get("LOCAL_RANK", "0"))
-
-# Numba reads the cache directory at import. A later assignment does not move it.
-os.environ["NUMBA_CACHE_DIR"] = _numba_cache_dir()
-
-import numba
-from numba import njit
-from dataclasses import replace
-
-import cv2
-
-numba.config.CACHE_DIR = os.environ["NUMBA_CACHE_DIR"]
-
+from ffcv.fields.base import Field
 from ffcv.fields.decoders import IntDecoder, RandomResizedCropRGBImageDecoder
 from ffcv.loader import Loader, OrderOption
-from ffcv.pipeline import PipelineSpec
-from ffcv.pipeline.compiler import Compiler
+from ffcv.loader.loader import DEFAULT_PROCESS_CACHE, ORDER_MAP, ORDER_TYPE
+from ffcv.memory_managers import MemoryManager, OSCacheManager, ProcessCacheManager
+from ffcv.pipeline import Compiler, PipelineSpec
+from ffcv.pipeline.graph import Graph
 from ffcv.pipeline.operation import Operation
-from ffcv.pipeline.state import State
 from ffcv.reader import Reader
 from ffcv.transforms import (
     NormalizeImage, RandomHorizontalFlip, ToDevice, ToTensor, ToTorchImage,
 )
 from ffcv.transforms.color_jitter import RandomColorJitter
-from ffcv.transforms.grayscale import RandomGrayscale
 from ffcv.transforms.ops import View
 from ffcv.transforms.solarization import RandomSolarization
+from ffcv.traversal_order.base import TraversalOrder
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255
+IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255
 
 class ImageFolderInstance(ImageFolder):
     def __getitem__(self, index):
@@ -183,138 +160,159 @@ class ImageFolderMask(ImageFolder):
         return output + (masks,)
 
 
-def _cell_token(value):
-    if isinstance(value, (int, float, str, bool, type(None))):
-        return repr(value)
-    if isinstance(value, tuple) and all(
-            isinstance(x, (int, float, str, bool, type(None))) for x in value):
-        return repr(value)
-    if isinstance(value, np.ndarray):
-        return repr((str(value.dtype), value.shape, np.round(value, 6).tolist()))
-    py = getattr(value, "py_func", None)
-    if py is not None:
-        return "njit:" + getattr(py, "__qualname__", py.__name__)
-    if callable(value):
-        return "fn:" + getattr(value, "__qualname__", type(value).__name__)
-    return type(value).__name__ + ":" + repr(value)
+class MultiLoader(Loader):
+    """Several pipelines reading one beton field. Same wiring as SimLAP."""
+
+    def __init__(self,
+                 fname: str,
+                 batch_size: int,
+                 num_workers: int = -1,
+                 cache_type: int = DEFAULT_PROCESS_CACHE,
+                 order: Union[ORDER_TYPE, TraversalOrder] = OrderOption.SEQUENTIAL,
+                 distributed: bool = False,
+                 seed: int = None,
+                 indices: Sequence[int] = None,
+                 pipelines: Mapping[str, Sequence[Union[Operation, torch.nn.Module]]] = {},
+                 custom_fields: Mapping[str, Type[Field]] = {},
+                 drop_last: bool = True,
+                 batches_ahead: int = 3,
+                 recompile: bool = False,
+                 ):
+        if distributed and order == OrderOption.RANDOM and seed is None:
+            print('Warning: no ordering seed was specified with distributed=True. '
+                  'Setting seed to 0 to match PyTorch distributed sampler.')
+            seed = 0
+        elif seed is None:
+            tinfo = np.iinfo('int32')
+            seed = np.random.randint(0, tinfo.max)
+
+        self._args = {
+            'fname': fname,
+            'batch_size': batch_size,
+            'num_workers': num_workers,
+            'os_cache': cache_type,
+            'order': order,
+            'distributed': distributed,
+            'seed': seed,
+            'indices': indices,
+            'pipelines': pipelines,
+            'drop_last': drop_last,
+            'batches_ahead': batches_ahead,
+            'recompile': recompile,
+        }
+        self.fname = fname
+        self.batch_size = batch_size
+        self.batches_ahead = batches_ahead
+        self.seed = seed
+        self.reader = Reader(self.fname, custom_fields)
+        self.num_workers = num_workers
+        self.drop_last = drop_last
+        self.distributed = distributed
+        self.code = None
+        self.recompile = recompile
+
+        if self.num_workers < 1:
+            self.num_workers = cpu_count()
+        Compiler.set_num_threads(self.num_workers)
+
+        if indices is None:
+            self.indices = np.arange(self.reader.num_samples, dtype='uint64')
+        else:
+            self.indices = np.array(indices)
+
+        if cache_type == 0:
+            self.memory_manager: MemoryManager = OSCacheManager(self.reader)
+        elif cache_type == 1:
+            self.memory_manager: MemoryManager = ProcessCacheManager(self.reader)
+        elif cache_type == 2:
+            from ffcv.memory_managers.shared_cache import SharedMemoryManager
+            self.memory_manager = SharedMemoryManager(self.reader)
+        else:
+            raise ValueError("Unknown cache type. Use 0 for process cache, 1 for os cache, or 2 for no cache.")
+
+        if order in ORDER_MAP:
+            self.traversal_order = ORDER_MAP[order](self)
+        elif isinstance(order, TraversalOrder):
+            self.traversal_order = order(self)
+        elif issubclass(order, TraversalOrder):
+            self.traversal_order = order(self)
+        else:
+            raise ValueError(f"Order {order} is not a supported order type or a subclass of TraversalOrder")
+
+        memory_read = self.memory_manager.compile_reader()
+        self.next_epoch = 0
+        self.pipelines = {}
+        self.pipeline_specs = {}
+        self.field_name_to_f_ix = {}
+        custom_pipeline_specs = {}
+
+        for output_name, spec in pipelines.items():
+            if isinstance(spec, PipelineSpec):
+                pass
+            elif isinstance(spec, Sequence):
+                spec = PipelineSpec(output_name, decoder=None, transforms=spec)
+            elif spec is None:
+                continue
+            else:
+                raise ValueError(
+                    f"The pipeline for {output_name} has to be "
+                    "either a PipelineSpec or a sequence of operations")
+            custom_pipeline_specs[output_name] = spec
+
+        default_name_to_f_ix = {}
+        for f_ix, (field_name, _field) in enumerate(self.reader.handlers.items()):
+            default_name_to_f_ix[field_name] = f_ix
+
+        for field_name, spec in custom_pipeline_specs.items():
+            # Graph looks up the beton field, not the output name.
+            self.field_name_to_f_ix[spec.source] = default_name_to_f_ix[spec.source]
+            self.field_name_to_f_ix[field_name] = self.field_name_to_f_ix[spec.source]
+            if field_name not in self.pipeline_specs:
+                self.pipeline_specs[field_name] = spec
+
+        self.graph = Graph(self.pipeline_specs, self.reader.handlers,
+                           self.field_name_to_f_ix, self.reader.metadata,
+                           memory_read)
+        self.generate_code()
+        self.first_traversal_order = self.next_traversal_order()
 
 
-def _stamp_closure(fn):
-    """Put closed-over crop settings into the qualname Numba uses as its cache key.
+class RandomGaussianBlur(nn.Module):
+    """Per-image blur. Runs after ToDevice, so it is not a Numba stage."""
 
-    Numba keys a cached function by source and qualname, not by closure cells.
-    Two decoders that share one nested function and close over different scales
-    would otherwise load each other's machine code.
-    """
-    cells = fn.__closure__
-    if not cells:
-        return
-    token = "|".join(_cell_token(cell.cell_contents) for cell in cells)
-    digest = hashlib.sha1(token.encode()).hexdigest()[:16]
-    fn.__qualname__ = fn.__qualname__ + "." + digest
+    def __init__(self, p):
+        super().__init__()
+        self.p = p
+        self.op = tfms.GaussianBlur(3, sigma=(0.1, 2.0))
 
-
-def _enable_ffcv_numba_cache():
-    """Compile FFCV's Numba stages once and reuse them from this node's /tmp."""
-    numba.config.CACHE_DIR = os.environ["NUMBA_CACHE_DIR"]
-    if getattr(Compiler, "_cache_patched", False):
-        return
-
-    @classmethod
-    def compile(cls, code, signature=None):
-        parallel = False
-        if hasattr(code, "is_parallel"):
-            parallel = code.is_parallel and cls.num_threads > 1
-        if not cls.is_enabled:
-            return code
-        _stamp_closure(code)
-        return njit(signature, fastmath=True, nogil=True, error_model="numpy",
-                    parallel=parallel, cache=True)(code)
-
-    Compiler.compile = compile
-    Compiler._cache_patched = True
+    def forward(self, images):
+        if self.p >= 1:
+            return self.op(images)
+        if self.p <= 0:
+            return images
+        keep = torch.rand(images.shape[0], device=images.device) >= self.p
+        blurred = self.op(images)
+        return torch.where(keep.view(-1, 1, 1, 1), images, blurred)
 
 
-def _warm_one_batch(loader):
-    """Run one batch so this process writes the Numba cache before its peers compile."""
-    it = iter(loader)
-    try:
-        next(it)
-    finally:
-        # Stop the worker before tearing down its memory. close() drops the
-        # cache while the thread may still be inside the pipeline.
-        it.terminate_event.set()
-        it.join(timeout=300)
-        alive = it.is_alive()
-        it.close()
-        if alive:
-            raise RuntimeError("FFCV warmup thread did not stop")
-
-
-def _warmup_marker():
-    return os.path.join(_numba_cache_dir(), "warmup.done")
-
-
-def _wait_warmup():
-    """Wait until rank 0 has finished compiling. A NCCL barrier dies after 10 minutes."""
-    path = _warmup_marker()
-    # ponytail: 3h ceiling so a dead rank 0 does not hold the node until the job walltime
-    deadline = time.time() + 3 * 60 * 60
-    while not os.path.exists(path):
-        if time.time() >= deadline:
-            raise TimeoutError("Numba warmup did not finish: " + path)
-        time.sleep(5)
-
-
-def _mark_warmup():
-    path = _warmup_marker()
-    tmp = path + "." + str(os.getpid())
-    with open(tmp, "w") as fh:
-        fh.write("ok\n")
-    os.replace(tmp, path)
-
-
-def _crop_ops(size, scale, blur_p, solar_p):
-    class CvBlur(Operation):
-        def __init__(self, p):
-            super().__init__()
-            self.p = p
-
-        def generate_code(self):
-            p = self.p
-
-            def blur(images, _dst):
-                for i in range(images.shape[0]):
-                    if np.random.random() < p:
-                        sigma = float(np.random.uniform(0.1, 2.0))
-                        images[i] = cv2.GaussianBlur(images[i], (0, 0), sigmaX=sigma, sigmaY=sigma)
-                return images
-
-            return blur
-
-        def declare_state_and_memory(self, previous_state: State):
-            # cv2 is not numba-safe, so this stage stays in Python.
-            return replace(previous_state, jit_mode=False), None
-
-    ops = [
-        RandomResizedCropRGBImageDecoder((size, size), scale=tuple(scale)),
+def _crop_pipeline(size, scale, blur_p, solar_p, device):
+    transforms = [
         RandomHorizontalFlip(),
         RandomColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
-        RandomGrayscale(p=0.2),
-        CvBlur(blur_p),
-    ]
-    if solar_p:
-        ops.append(RandomSolarization(p=solar_p))
-    return ops
-
-
-def _normalize_ops(device):
-    return [
         NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float32),
         ToTensor(),
-        ToTorchImage(channels_last=False),
+        ToTorchImage(),
         ToDevice(device, non_blocking=True),
+        tfms.RandomGrayscale(p=0.2),
+        RandomGaussianBlur(blur_p),
     ]
+    if solar_p:
+        transforms.insert(2, RandomSolarization(128, p=solar_p))
+    return PipelineSpec(
+        'image',
+        RandomResizedCropRGBImageDecoder((size, size), scale=tuple(scale)),
+        transforms=transforms,
+    )
 
 
 class IBotFFCVLoader:
@@ -323,18 +321,6 @@ class IBotFFCVLoader:
     def __init__(self, fname, batch_size, num_workers, global_crops_scale, local_crops_scale,
                  global_crops_number, local_crops_number, patch_size, pred_ratio, pred_ratio_var,
                  pred_aspect_ratio, pred_shape, pred_start_epoch, distributed, seed):
-        _enable_ffcv_numba_cache()
-        
-        if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
-            world = torch.distributed.get_world_size()
-        else:
-            world = 1
-        # Local rank 0 compiles into this node's /tmp. The others poll a file.
-        # A global rank is wrong here: another node's /tmp is invisible.
-        # dist.barrier is an ALLREDUCE and the NCCL watchdog kills it after 10 minutes.
-        if world > 1 and _local_rank() != 0:
-            _wait_warmup()
-
         if torch.cuda.is_available():
             device = torch.device('cuda', torch.cuda.current_device())
         else:
@@ -348,24 +334,20 @@ class IBotFFCVLoader:
         self.dataset = self
         self.epoch = 0
 
-        crop_specs = []
-        crop_specs.append((224, global_crops_scale, 1.0, 0.0))
+        crop_specs = [(224, global_crops_scale, 1.0, 0.0)]
         for _ in range(global_crops_number - 1):
             crop_specs.append((224, global_crops_scale, 0.1, 0.2))
         for _ in range(local_crops_number):
             crop_specs.append((96, local_crops_scale, 0.5, 0.0))
         self._grids = [size // patch_size for size, _, _, _ in crop_specs]
 
-        fields = list(Reader(fname).handlers)
-        pipelines = {name: None for name in fields}
-        pipelines['label'] = [
-            IntDecoder(), ToTensor(), ToDevice(device, non_blocking=True), View(-1),
-        ]
+        pipelines = {
+            'label': [IntDecoder(), ToTensor(), ToDevice(device, non_blocking=True), View(-1)],
+        }
         for i, (size, scale, blur_p, solar_p) in enumerate(crop_specs):
-            ops = _crop_ops(size, scale, blur_p, solar_p) + _normalize_ops(device)
-            pipelines[f'crop{i}'] = PipelineSpec('image', decoder=ops[0], transforms=ops[1:])
+            pipelines[f'crop{i}'] = _crop_pipeline(size, scale, blur_p, solar_p, device)
 
-        self.loader = Loader(
+        self.loader = MultiLoader(
             fname,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -375,13 +357,6 @@ class IBotFFCVLoader:
             pipelines=pipelines,
             drop_last=True,
         )
-        if world > 1 and _local_rank() == 0:
-            epoch = self.loader.next_epoch
-            _warm_one_batch(self.loader)
-            # The warmup batch advances next_epoch. Training sets it again,
-            # but a caller that does not would walk a different order than its peers.
-            self.loader.next_epoch = epoch
-            _mark_warmup()
         self.num_samples = int(self.loader.reader.num_samples)
 
     def set_epoch(self, epoch):
@@ -427,42 +402,6 @@ def _check_masks():
     assert not held.batch(2, 8, 8).any()
 
 
-def _check_closure_stamp():
-    def make(scale):
-        def decode(x):
-            return x + scale
-        return decode
-
-    first = make((0.14, 1.0))
-    second = make((0.05, 0.4))
-    again = make((0.14, 1.0))
-    _stamp_closure(first)
-    _stamp_closure(second)
-    _stamp_closure(again)
-    assert first.__qualname__ != second.__qualname__
-    assert first.__qualname__ == again.__qualname__
-
-
-def _check_warmup_marker():
-    import tempfile
-    old = os.environ.get("NUMBA_CACHE_LOCAL")
-    with tempfile.TemporaryDirectory() as tmp:
-        os.environ["NUMBA_CACHE_LOCAL"] = tmp
-        try:
-            assert _numba_cache_dir() == tmp
-            assert not os.path.exists(_warmup_marker())
-            _mark_warmup()
-            assert os.path.exists(_warmup_marker())
-            assert _warmup_marker().startswith(tmp)
-        finally:
-            if old is None:
-                os.environ.pop("NUMBA_CACHE_LOCAL", None)
-            else:
-                os.environ["NUMBA_CACHE_LOCAL"] = old
-
-
 if __name__ == '__main__':
     _check_masks()
-    _check_closure_stamp()
-    _check_warmup_marker()
     print('mask sampler ok')
