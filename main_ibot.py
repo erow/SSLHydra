@@ -598,17 +598,39 @@ def _merge_param_groups(student_groups, hydra_groups):
     ]
 
 
+def _stats_along_samples(table, chunk=4096):
+    """Mean and std of each column, reduced over the sample axis."""
+    n, d = table.shape
+    total = np.zeros(d, dtype=np.float64)
+    sq = np.zeros(d, dtype=np.float64)
+    for start in range(0, n, chunk):
+        x = np.asarray(table[start:start + chunk], dtype=np.float64)
+        total += x.sum(axis=0)
+        sq += np.square(x).sum(axis=0)
+    mean = total / n
+    var = sq / n - np.square(mean)
+    std = np.sqrt(np.maximum(var, 1e-12))
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
 class TeacherTable:
-    """CPU memmap of frozen teacher vectors. Copies one batch per step."""
+    """CPU memmap of frozen teacher vectors. Copies one batch per step.
+
+    Rows are z-scored along the sample axis: each dimension has mean 0 and
+    std 1 over the full table, so a shared direction does not dominate.
+    """
 
     def __init__(self, path):
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
         self.table = np.load(path, mmap_mode='r')
         self.dim = int(self.table.shape[1])
+        self.mean, self.std = _stats_along_samples(self.table)
 
     def take(self, idx):
         rows = np.asarray(self.table[idx.numpy()], dtype=np.float32)
+        rows -= self.mean
+        rows /= self.std
         return torch.from_numpy(rows)
 
 
@@ -693,6 +715,11 @@ class Hydra(nn.Module):
 
 
 def _check_hydra():
+    raw = np.array([[1., 2., 3.], [3., 4., 5.], [5., 6., 9.]], dtype=np.float32)
+    mean, std = _stats_along_samples(raw)
+    got = (raw - mean) / std
+    assert np.allclose(got.mean(0), 0, atol=1e-5)
+    assert np.allclose(got.std(0), 1, atol=1e-5)
     torch.manual_seed(0)
     b, d, c = 4, 8, 6
     t_p = torch.tensor([
