@@ -29,7 +29,6 @@ from models.head import iBOTHead
 from loader import IBotFFCVLoader, ImageFolderMask
 from evaluation.unsupervised.unsup_cls import eval_pred
 from fused_gated_contrast import fused_gated_contrast
-from simlap import gather_with_grad
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -613,19 +612,36 @@ class TeacherTable:
         return torch.from_numpy(rows)
 
 
-def sample_partner(t_p, strategy, tau):
-    """Partner index inside the local batch. Never the row itself."""
-    b = t_p.shape[0]
-    if b < 2:
-        raise RuntimeError(f"Hydra partner sampling needs batch size >= 2, got {b}")
+def _all_gather(tensor):
+    """Concatenate a teacher tensor across ranks. No gradient."""
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        return tensor
+    tensor = tensor.contiguous()
+    parts = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(parts, tensor)
+    return torch.cat(parts, dim=0)
+
+
+def _sample_rows(t_all, rows, strategy, tau):
+    """Partner index into ``t_all`` for each query row. Never ``rows`` itself."""
+    b = rows.shape[0]
+    n = t_all.shape[0]
+    if n < 2:
+        raise RuntimeError(f"Hydra partner sampling needs at least 2 keys, got {n}")
     if strategy == 'rand':
-        t_idx = torch.randint(0, b - 1, (b,), device=t_p.device)
-        arange = torch.arange(b, device=t_p.device)
-        return t_idx + (t_idx >= arange).long()
-    u = F.normalize(t_p, dim=-1)
-    m = u @ u.T
-    m = m.masked_fill(torch.eye(b, dtype=torch.bool, device=t_p.device), float('-inf'))
+        t_idx = torch.randint(0, n - 1, (b,), device=t_all.device)
+        return t_idx + (t_idx >= rows).long()
+    q = F.normalize(t_all[rows], dim=-1)
+    k = F.normalize(t_all, dim=-1)
+    m = q @ k.T
+    m[torch.arange(b, device=m.device), rows] = float('-inf')
     return torch.multinomial(torch.softmax(m / tau, dim=-1), 1).squeeze(1)
+
+
+def sample_partner(t_p, strategy, tau):
+    """Partner index inside this tensor. Never the row itself."""
+    b = t_p.shape[0]
+    return _sample_rows(t_p, torch.arange(b, device=t_p.device), strategy, tau)
 
 
 class Hydra(nn.Module):
@@ -647,21 +663,24 @@ class Hydra(nn.Module):
         same = z_s is z_t
         z_t = z_t.detach()
         t_p = t_p.detach()
-        keys = gather_with_grad(z_t)
         b = z_s.shape[0]
+        # Teacher side only. dist.all_gather keeps z_t and t_p in the same rank order.
+        keys = _all_gather(z_t)
+        t_all = _all_gather(t_p)
         offset = utils.get_rank() * b
+        rows = torch.arange(b, device=z_s.device) + offset
         total = 0
         for _ in range(self.k):
             with torch.no_grad():
-                t_idx = sample_partner(t_p, self.strategy, self.tau)
-            pair = (t_p + t_p[t_idx]) * 0.5
+                t_idx = _sample_rows(t_all, rows, self.strategy, self.tau)
+            pair = (t_all[rows] + t_all[t_idx]) * 0.5
             gate = self.gate(pair).sigmoid()
             logits = fused_gated_contrast(z_s, keys, gate) / self.temperature
             if same:
-                rows = torch.arange(b, device=logits.device)
+                local = torch.arange(b, device=logits.device)
                 logits = logits.clone()
-                logits[rows, rows + offset] = float('-inf')
-            total = total + F.cross_entropy(logits, t_idx + offset)
+                logits[local, local + offset] = float('-inf')
+            total = total + F.cross_entropy(logits, t_idx)
         return total / self.k
 
 
