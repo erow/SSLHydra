@@ -102,11 +102,69 @@ def _loss(student, teacher, hydra, table, batch, args):
     return hydra(student_output[0][:b], teacher_output[0][:b], t_p)
 
 
+def _gate_line(hydra):
+    stats = hydra.module.gate_stats
+    return (
+        f"gate_mean={stats['mean']:.4f} gate_std={stats['std']:.4f} "
+        f"gate_lo={stats['lo']:.4f} gate_hi={stats['hi']:.4f}"
+    )
+
+
+def _run_epoch(args, loader, student, teacher, hydra, table, opt):
+    """One pass over the training set. A new partner is drawn every step."""
+    loader.set_epoch(0)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.use_fp16)
+    student.train()
+    n = len(loader)
+    first = last = None
+    gate_first = gate_last = None
+    for step, batch in enumerate(loader):
+        opt.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(args.use_fp16):
+            loss = _loss(student, teacher, hydra, table, batch, args)
+        value = float(loss.detach())
+        if not math.isfinite(value):
+            print(f'hydra_epoch step={step} nonfinite loss={value}', flush=True)
+            sys.exit(1)
+        scaler.scale(loss).backward()
+        if args.clip_grad:
+            scaler.unscale_(opt)
+            utils.clip_gradients(student, args.clip_grad)
+            utils.clip_gradients(hydra, args.clip_grad)
+        scaler.step(opt)
+        scaler.update()
+        last = value
+        gate_last = dict(hydra.module.gate_stats)
+        if first is None:
+            first = last
+            gate_first = dict(gate_last)
+        if step % 100 == 0 or step + 1 == n:
+            print(
+                f'hydra_epoch step={step}/{n} loss={last:.4f} {_gate_line(hydra)}',
+                flush=True,
+            )
+    line = (
+        f'HYDRA_EPOCH steps={n} loss_first={first:.4f} loss_last={last:.4f} '
+        f'delta={first - last:.4f} '
+        f"gate_mean_first={gate_first['mean']:.4f} gate_mean_last={gate_last['mean']:.4f} "
+        f"gate_lo_last={gate_last['lo']:.4f} gate_hi_last={gate_last['hi']:.4f}"
+    )
+    print(line, flush=True)
+    if utils.is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, 'result.txt'), 'w') as f:
+            f.write(line + '\n')
+
+
 def main():
     parser = get_args_parser()
     parser.add_argument('--steps', default=1000, type=int)
+    parser.add_argument('--one_epoch', action='store_true')
     args = parser.parse_args()
     loader, student, teacher, hydra, table, opt = _build(args)
+    if args.one_epoch:
+        _run_epoch(args, loader, student, teacher, hydra, table, opt)
+        return
     batch = _one_batch(loader)
     scaler = torch.cuda.amp.GradScaler(enabled=args.use_fp16)
     student.eval()
@@ -141,7 +199,7 @@ def main():
                     gnorm += float(p.grad.detach().float().norm())
                     ngrad += 1
             print(
-                f'hydra_overfit step={step} loss={last:.4f} '
+                f'hydra_overfit step={step} loss={last:.4f} {_gate_line(hydra)} '
                 f'grad_norm={gnorm:.4f} ngrad={ngrad}',
                 flush=True,
             )

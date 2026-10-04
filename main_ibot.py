@@ -675,6 +675,14 @@ class Hydra(nn.Module):
                 t_idx = _sample_rows(t_all, rows, self.strategy, self.tau)
             pair = (t_all[rows] + t_all[t_idx]) * 0.5
             gate = self.gate(pair).sigmoid()
+            with torch.no_grad():
+                g = gate.detach().float()
+                self.gate_stats = {
+                    'mean': float(g.mean()),
+                    'std': float(g.std(unbiased=False)),
+                    'lo': float((g < 0.05).float().mean()),
+                    'hi': float((g > 0.95).float().mean()),
+                }
             logits = fused_gated_contrast(z_s, keys, gate) / self.temperature
             if same:
                 local = torch.arange(b, device=logits.device)
