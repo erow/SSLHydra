@@ -82,6 +82,8 @@ def _build(args):
         table.dim, args.out_dim, args.hydra_mlp_dim, args.hydra_temperature,
         args.hydra_tau, args.hydra_k, args.hydra_pair,
     ).cuda()
+    if utils.has_batchnorms(hydra):
+        hydra = nn.SyncBatchNorm.convert_sync_batchnorm(hydra)
     hydra = nn.parallel.DistributedDataParallel(hydra, device_ids=[args.gpu])
     groups = _merge_param_groups(
         utils.get_params_groups(student), utils.get_params_groups(hydra))

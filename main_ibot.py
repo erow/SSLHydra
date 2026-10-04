@@ -360,6 +360,8 @@ def train_ibot(args):
             args.hydra_k,
             args.hydra_pair,
         ).cuda()
+        if utils.has_batchnorms(hydra):
+            hydra = nn.SyncBatchNorm.convert_sync_batchnorm(hydra)
         hydra = nn.parallel.DistributedDataParallel(hydra, device_ids=[args.gpu])
     else:
         teacher_table = None
@@ -671,8 +673,10 @@ class Hydra(nn.Module):
 
     def __init__(self, teacher_dim, embed_dim, mlp_dim, temperature, tau, k, strategy):
         super().__init__()
+        self.z_norm = nn.LayerNorm(embed_dim)
         self.gate = nn.Sequential(
             nn.Linear(teacher_dim, mlp_dim),
+            nn.BatchNorm1d(mlp_dim),
             nn.ReLU(inplace=True),
             nn.Linear(mlp_dim, embed_dim),
         )
@@ -683,6 +687,7 @@ class Hydra(nn.Module):
 
     def forward(self, z_s, z_t, t_p):
         same = z_s is z_t
+        z_s = self.z_norm(z_s)
         z_t = z_t.detach()
         t_p = t_p.detach()
         b = z_s.shape[0]
@@ -744,7 +749,7 @@ def _check_hydra():
     torch.manual_seed(1)
     t_idx = sample_partner(t_p, 'rand', 0.1)
     gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
-    ref = F.cross_entropy(fused_gated_contrast(z_s, z_t, gate) / 0.2, t_idx)
+    ref = F.cross_entropy(fused_gated_contrast(hydra.z_norm(z_s), z_t, gate) / 0.2, t_idx)
     assert torch.allclose(loss, ref), (float(loss), float(ref))
     loss.backward()
     assert z_s.grad is not None and float(z_s.grad.abs().sum()) > 0
