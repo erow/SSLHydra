@@ -109,15 +109,19 @@ def main():
     loader, student, teacher, hydra, table, opt = _build(args)
     batch = _one_batch(loader)
     scaler = torch.cuda.amp.GradScaler(enabled=args.use_fp16)
-    student.train()
+    student.eval()
     first = None
     last = None
     for step in range(args.steps):
+        # Same partner every step. Otherwise the target moves and the loss cannot fall to zero.
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed(args.seed)
         opt.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(args.use_fp16):
             loss = _loss(student, teacher, hydra, table, batch, args)
-        if not math.isfinite(float(loss)):
-            print(f'hydra_overfit step={step} nonfinite loss={float(loss)}', flush=True)
+        value = float(loss.detach())
+        if not math.isfinite(value):
+            print(f'hydra_overfit step={step} nonfinite loss={value}', flush=True)
             sys.exit(1)
         scaler.scale(loss).backward()
         if args.clip_grad:
@@ -126,7 +130,7 @@ def main():
             utils.clip_gradients(hydra, args.clip_grad)
         scaler.step(opt)
         scaler.update()
-        last = float(loss)
+        last = value
         if first is None:
             first = last
         if step % 50 == 0 or step + 1 == args.steps:
