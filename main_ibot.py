@@ -166,8 +166,8 @@ def get_args_parser():
         help='InfoNCE temperature. Distinct from --hydra_tau.')
     parser.add_argument('--hydra_k', default=1, type=int,
         help='Number of partner draws / subspaces averaged into loss_hydra.')
-    parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand'],
-        help='Partner index: teacher similarity, or uniform over the other rows.')
+    parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand', 'self'],
+        help='Partner index: teacher similarity, uniform over the other rows, or the same sample.')
     parser.add_argument('--hydra_mlp_dim', default=1024, type=int,
         help='Hidden width of the gate MLP.')
     parser.add_argument('--hydra_weight', default=1.0, type=float,
@@ -645,8 +645,10 @@ def _all_gather(tensor):
 
 
 def _sample_rows(t_all, rows, strategy, tau):
-    """Partner index into ``t_all`` for each query row. Never ``rows`` itself."""
+    """Index into ``t_all``. ``self`` is ``rows``; ``sim`` and ``rand`` are not."""
     b = rows.shape[0]
+    if strategy == 'self':
+        return rows
     n = t_all.shape[0]
     if n < 2:
         raise RuntimeError(f"Hydra partner sampling needs at least 2 keys, got {n}")
@@ -661,7 +663,7 @@ def _sample_rows(t_all, rows, strategy, tau):
 
 
 def sample_partner(t_p, strategy, tau):
-    """Partner index inside this tensor. Never the row itself."""
+    """Partner index. ``self`` is the row itself; ``sim`` and ``rand`` are not."""
     b = t_p.shape[0]
     return _sample_rows(t_p, torch.arange(b, device=t_p.device), strategy, tau)
 
@@ -706,7 +708,8 @@ class Hydra(nn.Module):
                     'hi': float((g > 0.95).float().mean()),
                 }
             logits = fused_gated_contrast(z_s, keys, gate) / self.temperature
-            if same:
+            # Same tensor: the anchor column is not a key, unless it is the positive.
+            if same and self.strategy != 'self':
                 local = torch.arange(b, device=logits.device)
                 logits = logits.clone()
                 logits[local, local + offset] = float('-inf')
@@ -732,10 +735,12 @@ def _check_hydra():
     m = u @ u.T
     m = m.masked_fill(torch.eye(b, dtype=torch.bool), float('-inf'))
     assert int(torch.softmax(m / 1e-3, dim=-1)[0].argmax()) == 1
+    own = torch.arange(b)
+    assert torch.equal(sample_partner(t_p, 'self', 0.1), own)
     for _ in range(20):
         drawn = sample_partner(t_p, 'rand', 0.1)
-        assert not torch.equal(drawn, torch.arange(b))
-        assert int((drawn == torch.arange(b)).sum()) == 0
+        assert not torch.equal(drawn, own)
+        assert int((drawn == own).sum()) == 0
     hydra = Hydra(c, d, 16, temperature=0.2, tau=0.1, k=1, strategy='rand')
     z_s = torch.randn(b, d, requires_grad=True)
     z_t = torch.randn(b, d)
@@ -750,6 +755,13 @@ def _check_hydra():
     assert z_s.grad is not None and float(z_s.grad.abs().sum()) > 0
     assert hydra.gate[0].weight.grad is not None
     assert t_p.grad is None
+    hydra_self = Hydra(c, d, 16, temperature=0.2, tau=0.1, k=1, strategy='self')
+    zs = torch.randn(b, d, requires_grad=True)
+    zt = torch.randn(b, d)
+    loss_self = hydra_self(zs, zt, t_p)
+    gate_self = hydra_self.gate(t_p).sigmoid()
+    ref_self = F.cross_entropy(fused_gated_contrast(zs, zt, gate_self) / 0.2, own)
+    assert torch.allclose(loss_self, ref_self), (float(loss_self), float(ref_self))
     z = torch.randn(b, d, requires_grad=True)
     same = hydra(z, z, t_p)
     same.backward()
