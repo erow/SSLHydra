@@ -167,8 +167,8 @@ def get_args_parser():
         help='InfoNCE temperature. Distinct from --hydra_tau.')
     parser.add_argument('--hydra_k', default=1, type=int,
         help='Number of partner draws / subspaces averaged into loss_hydra.')
-    parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand'],
-        help='Partner index: teacher similarity, or uniform over the other rows.')
+    parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand', 'self'],
+        help='Partner index: teacher similarity, uniform over the other rows, or the same sample.')
     parser.add_argument('--hydra_mlp_dim', default=1024, type=int,
         help='Hidden width of the gate MLP.')
     parser.add_argument('--hydra_weight', default=1.0, type=float,
@@ -691,8 +691,10 @@ def _all_gather(tensor):
 
 
 def _sample_rows(t_all, rows, strategy, tau):
-    """Partner index into ``t_all`` for each query row. Never ``rows`` itself."""
+    """Index into ``t_all``. ``self`` is ``rows``; ``sim`` and ``rand`` are not."""
     b = rows.shape[0]
+    if strategy == 'self':
+        return rows
     n = t_all.shape[0]
     if n < 2:
         raise RuntimeError(f"Hydra partner sampling needs at least 2 keys, got {n}")
@@ -740,7 +742,7 @@ def _grad_norm(*models):
 
 
 def sample_partner(t_p, strategy, tau):
-    """Partner index inside this tensor. Never the row itself."""
+    """Partner index. ``self`` is the row itself; ``sim`` and ``rand`` are not."""
     b = t_p.shape[0]
     return _sample_rows(t_p, torch.arange(b, device=t_p.device), strategy, tau)
 
@@ -840,10 +842,12 @@ def _check_hydra():
     m = u @ u.T
     m = m.masked_fill(torch.eye(b, dtype=torch.bool), float('-inf'))
     assert int(torch.softmax(m / 1e-3, dim=-1)[0].argmax()) == 1
+    own = torch.arange(b)
+    assert torch.equal(sample_partner(t_p, 'self', 0.1), own)
     for _ in range(20):
         drawn = sample_partner(t_p, 'rand', 0.1)
-        assert not torch.equal(drawn, torch.arange(b))
-        assert int((drawn == torch.arange(b)).sum()) == 0
+        assert not torch.equal(drawn, own)
+        assert int((drawn == own).sum()) == 0
     hydra = Hydra(c, d, 16, temperature=0.2, tau=0.1, k=1, strategy='rand')
     h_s = torch.randn(2 * b, d, requires_grad=True)
     h_t = torch.randn(2 * b, d, requires_grad=True)
@@ -870,6 +874,25 @@ def _check_hydra():
     assert hydra.gate[0].weight.grad is not None
     assert t_p.grad is None
     assert math.isfinite(float(loss.detach()))
+    hydra_self = Hydra(c, d, 16, temperature=0.2, tau=0.1, k=1, strategy='self')
+    hs = torch.randn(2 * b, d, requires_grad=True)
+    ht = torch.randn(2 * b, d)
+    loss_self = hydra_self(hs, ht, t_p)
+    zs = hydra_self.predictor(hydra_self.projector(hs))
+    zt = hydra_self.projector(ht)
+    s0, s1 = zs.chunk(2, dim=0)
+    t0, t1 = zt.chunk(2, dim=0)
+    # Partner is this sample, so the gate sees t_p averaged with itself.
+    gate_self = hydra_self.gate(t_p).sigmoid()
+    ref_self = (
+        F.cross_entropy(fused_gated_contrast(s0, t1, gate_self) / 0.2, own)
+        + F.cross_entropy(fused_gated_contrast(s1, t0, gate_self) / 0.2, own)
+    ) / 2
+    assert torch.allclose(loss_self, ref_self), (float(loss_self), float(ref_self))
+    z = torch.randn(2 * b, d, requires_grad=True)
+    same = hydra(z, z, t_p)
+    same.backward()
+    assert math.isfinite(float(same.detach()))
     print('hydra ok', float(loss.detach()))
 
 
