@@ -87,10 +87,12 @@ def _build(args):
     return loader, student, teacher, hydra, table, opt
 
 
-def _backbone_cls(wrapper, images, masks, n):
+def _view_cls(wrapper, images, masks, view, b):
+    """Backbone [CLS] of one global crop."""
     out = wrapper(images) if masks is None else wrapper(images, mask=masks)
     tokens = out[0] if isinstance(out, tuple) else out
-    return _cls_token(tokens)[:n]
+    cls = _cls_token(tokens)
+    return cls[view * b:(view + 1) * b]
 
 
 def _loss(student, teacher, hydra, table, batch, args):
@@ -100,9 +102,8 @@ def _loss(student, teacher, hydra, table, batch, args):
     b = labels.shape[0]
     crops = images[:args.global_crops_number]
     crop_masks = masks[:args.global_crops_number]
-    with torch.no_grad():
-        h_t = _backbone_cls(teacher, crops, None, b)
-    h_s = _backbone_cls(student, crops, crop_masks, b)
+    h_s = _view_cls(student, crops, crop_masks, 0, b)
+    h_t = _view_cls(teacher, crops, None, 1, b)
     t_p = table.take(idx).cuda(non_blocking=True)
     return hydra(h_s, h_t, t_p)
 
@@ -184,9 +185,8 @@ def _snapshot(student, teacher, hydra, table, batch, args):
     h = hydra.module
     with torch.no_grad():
         crops = images[:args.global_crops_number]
-        h_t = _backbone_cls(teacher, crops, None, b)
-        h_s = _backbone_cls(
-            student, crops, masks[:args.global_crops_number], b)
+        h_s = _view_cls(student, crops, masks[:args.global_crops_number], 0, b)
+        h_t = _view_cls(teacher, crops, None, 1, b)
         t_p = table.take(idx).cuda()
         z_s = h.predictor(h.projector(h_s))
         z_t = h.projector(h_t)

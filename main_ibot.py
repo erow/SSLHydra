@@ -29,6 +29,7 @@ from models.head import iBOTHead
 from loader import IBotFFCVLoader, ImageFolderMask
 from evaluation.unsupervised.unsup_cls import eval_pred
 from fused_gated_contrast import fused_gated_contrast
+from simlap import gather_with_grad
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -498,13 +499,17 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             crops = images[:args.global_crops_number]
             crop_masks = masks[:args.global_crops_number]
             if args.loss == 'both':
-                teacher_tokens, teacher_output = teacher(crops, return_backbone_feat=True)
-                student_tokens, student_output = student(
+                # First return is the backbone. The head tuple is only for iBOT.
+                teacher_backbone, teacher_output = teacher(crops, return_backbone_feat=True)
+                student_backbone, student_output = student(
                     crops, mask=crop_masks, return_backbone_feat=True)
+            elif args.loss == 'hydra':
+                teacher_backbone = teacher(crops)
+                student_backbone = student(crops, mask=crop_masks)
+                teacher_output = student_output = None
             else:
                 teacher_output = teacher(crops)
                 student_output = student(crops, mask=crop_masks)
-                teacher_tokens = student_tokens = None
             
             # get local views
             student.module.backbone.masked_im_modeling = False
@@ -520,13 +525,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
                 if idx is None:
                     raise RuntimeError("Hydra needs the FFCV sample index; use an .ffcv data_path")
                 b = labels.shape[0]
-                # First global crop. Backbone [CLS], not the iBOT head.
+                if args.global_crops_number < 2:
+                    raise RuntimeError("Hydra contrasts two global views")
+                # Backbone [CLS] only. Student view 0, teacher view 1.
                 t_p = teacher_table.take(idx).cuda(non_blocking=True)
-                if args.loss == 'hydra':
-                    h_s, h_t = student_output, teacher_output
-                else:
-                    h_s, h_t = student_tokens, teacher_tokens
-                loss_hydra = hydra(_cls_token(h_s)[:b], _cls_token(h_t)[:b], t_p)
+                cls_s = _cls_token(student_backbone)
+                cls_t = _cls_token(teacher_backbone)
+                loss_hydra = hydra(cls_s[:b], cls_t[b:2 * b], t_p)
                 all_loss['hydra'] = loss_hydra
                 term = args.hydra_weight * loss_hydra
                 loss = term if loss is None else loss + term
@@ -754,11 +759,11 @@ class Hydra(nn.Module):
     def forward(self, h_s, h_t, t_p):
         same = h_s is h_t
         z_s = self.predictor(self.projector(h_s))
-        z_t = self.projector(h_t).detach()
+        z_t = self.projector(h_t)
         t_p = t_p.detach()
         b = z_s.shape[0]
-        # Teacher side only. dist.all_gather keeps z_t and t_p in the same rank order.
-        keys = _all_gather(z_t)
+        # Keys keep their gradient. The teacher table does not.
+        keys = gather_with_grad(z_t)
         t_all = _all_gather(t_p)
         offset = utils.get_rank() * b
         rows = torch.arange(b, device=z_s.device) + offset
@@ -812,7 +817,7 @@ def _check_hydra():
         assert int((drawn == torch.arange(b)).sum()) == 0
     hydra = Hydra(c, d, 16, temperature=0.2, tau=0.1, k=1, strategy='rand')
     z_s = torch.randn(b, d, requires_grad=True)
-    z_t = torch.randn(b, d)
+    z_t = torch.randn(b, d, requires_grad=True)
     torch.manual_seed(1)
     loss = hydra(z_s, z_t, t_p)
     torch.manual_seed(1)
@@ -824,6 +829,7 @@ def _check_hydra():
     assert torch.allclose(loss, ref), (float(loss), float(ref))
     loss.backward()
     assert z_s.grad is not None and float(z_s.grad.abs().sum()) > 0
+    assert z_t.grad is not None and float(z_t.grad.abs().sum()) > 0
     assert hydra.projector[0].weight.grad is not None
     assert hydra.predictor[0].weight.grad is not None
     assert hydra.gate[0].weight.grad is not None
