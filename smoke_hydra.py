@@ -102,16 +102,12 @@ def _loss(student, teacher, hydra, table, batch, args):
     images, labels, masks, idx = batch
     images = [im.cuda(non_blocking=True) for im in images]
     masks = [msk.cuda(non_blocking=True) for msk in masks]
-    b = labels.shape[0]
     crops = images[:args.global_crops_number]
     crop_masks = masks[:args.global_crops_number]
     cls_s = _cls(student, crops, crop_masks)
     cls_t = _cls(teacher, crops, None)
     t_p = table.take(idx).cuda(non_blocking=True)
-    return (
-        hydra(cls_s[:b], cls_t[b:2 * b], t_p)
-        + hydra(cls_s[b:2 * b], cls_t[:b], t_p)
-    ) / 2
+    return hydra(cls_s, cls_t, t_p)
 
 
 def _gate_line(hydra):

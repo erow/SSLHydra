@@ -524,17 +524,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             if args.loss in ('hydra', 'both'):
                 if idx is None:
                     raise RuntimeError("Hydra needs the FFCV sample index; use an .ffcv data_path")
-                b = labels.shape[0]
                 if args.global_crops_number < 2:
                     raise RuntimeError("Hydra contrasts two global views")
-                # Backbone [CLS] only. Each direction pairs one view with the other.
+                # Backbone [CLS] of both global views. Hydra chunks after the norm.
                 t_p = teacher_table.take(idx).cuda(non_blocking=True)
                 cls_s = _cls_token(student_backbone)
                 cls_t = _cls_token(teacher_backbone)
-                loss_hydra = (
-                    hydra(cls_s[:b], cls_t[b:2 * b], t_p)
-                    + hydra(cls_s[b:2 * b], cls_t[:b], t_p)
-                ) / 2
+                loss_hydra = hydra(cls_s, cls_t, t_p)
                 all_loss['hydra'] = loss_hydra
                 term = args.hydra_weight * loss_hydra
                 loss = term if loss is None else loss + term
@@ -724,16 +720,6 @@ def sample_partner(t_p, strategy, tau):
     return _sample_rows(t_p, torch.arange(b, device=t_p.device), strategy, tau)
 
 
-def _clone_bn_buffers(module):
-    for m in module.modules():
-        if not isinstance(m, nn.modules.batchnorm._BatchNorm) or m.running_mean is None:
-            continue
-        m.running_mean = m.running_mean.detach().clone()
-        m.running_var = m.running_var.detach().clone()
-        if m.num_batches_tracked is not None:
-            m.num_batches_tracked = m.num_batches_tracked.detach().clone()
-
-
 def _cls_token(tokens):
     """Backbone tokens are [B, 1+N, C]. The [CLS] token is index 0."""
     return tokens[:, 0] if tokens.ndim == 3 else tokens
@@ -769,16 +755,9 @@ class Hydra(nn.Module):
         self.force_ones = False
         self.monitor = {}
 
-    def forward(self, h_s, h_t, t_p):
-        # Two directions share one backward. Batch-norm updates its buffers
-        # in place, which would bump a tensor saved by the other direction.
-        _clone_bn_buffers(self)
-        same = h_s is h_t
-        z_s = self.predictor(self.projector(h_s))
-        z_t = self.projector(h_t)
-        t_p = t_p.detach()
+    def _direction(self, z_s, z_t, t_p):
+        """One view as the query, the other view as the keys."""
         b = z_s.shape[0]
-        # Keys keep their gradient. The teacher table does not.
         keys = gather_with_grad(z_t)
         t_all = _all_gather(t_p)
         offset = utils.get_rank() * b
@@ -800,13 +779,22 @@ class Hydra(nn.Module):
                     'hi': float((g > 0.95).float().mean()),
                 }
             logits = fused_gated_contrast(z_s, keys, gate) / self.temperature
-            if same:
-                local = torch.arange(b, device=logits.device)
-                logits = logits.clone()
-                logits[local, local + offset] = float('-inf')
             total = total + F.cross_entropy(logits, t_idx)
         self.monitor = _hydra_monitor(z_s, keys, t_all, rows, logits, self.tau)
         return total / self.k
+
+    def forward(self, h_s, h_t, t_p):
+        # Both views share one norm. Chunk only after that.
+        z_s = self.predictor(self.projector(h_s))
+        z_t = self.projector(h_t)
+        t_p = t_p.detach()
+        q0, q1 = z_s.chunk(2, dim=0)
+        k0, k1 = z_t.chunk(2, dim=0)
+        loss0 = self._direction(q0, k1, t_p)
+        mon0 = dict(self.monitor)
+        loss1 = self._direction(q1, k0, t_p)
+        self.monitor = {key: (mon0[key] + self.monitor[key]) / 2 for key in mon0}
+        return (loss0 + loss1) / 2
 
 
 def _check_hydra():
@@ -832,31 +820,32 @@ def _check_hydra():
         assert not torch.equal(drawn, torch.arange(b))
         assert int((drawn == torch.arange(b)).sum()) == 0
     hydra = Hydra(c, d, 16, temperature=0.2, tau=0.1, k=1, strategy='rand')
-    z_s = torch.randn(b, d, requires_grad=True)
-    z_t = torch.randn(b, d, requires_grad=True)
+    h_s = torch.randn(2 * b, d, requires_grad=True)
+    h_t = torch.randn(2 * b, d, requires_grad=True)
     torch.manual_seed(1)
-    loss = hydra(z_s, z_t, t_p)
+    loss = hydra(h_s, h_t, t_p)
     torch.manual_seed(1)
-    t_idx = sample_partner(t_p, 'rand', 0.1)
-    gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
-    z_q = hydra.predictor(hydra.projector(z_s))
-    z_k = hydra.projector(z_t)
-    ref = F.cross_entropy(fused_gated_contrast(z_q, z_k, gate) / 0.2, t_idx)
+    z_s = hydra.predictor(hydra.projector(h_s))
+    z_t = hydra.projector(h_t)
+    q0, q1 = z_s.chunk(2, dim=0)
+    k0, k1 = z_t.chunk(2, dim=0)
+
+    def one(q, k):
+        t_idx = sample_partner(t_p, 'rand', 0.1)
+        gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
+        return F.cross_entropy(fused_gated_contrast(q, k, gate) / 0.2, t_idx)
+
+    ref = (one(q0, k1) + one(q1, k0)) / 2
     assert torch.allclose(loss, ref), (float(loss), float(ref))
     loss.backward()
-    both = (hydra(z_s, z_t, t_p) + hydra(z_t, z_s, t_p)) / 2
-    both.backward()
-    assert z_s.grad is not None and float(z_s.grad.abs().sum()) > 0
-    assert z_t.grad is not None and float(z_t.grad.abs().sum()) > 0
+    assert h_s.grad is not None and float(h_s.grad.abs().sum()) > 0
+    assert h_t.grad is not None and float(h_t.grad.abs().sum()) > 0
     assert hydra.projector[0].weight.grad is not None
     assert hydra.predictor[0].weight.grad is not None
     assert hydra.gate[0].weight.grad is not None
     assert t_p.grad is None
-    z = torch.randn(b, d, requires_grad=True)
-    same = hydra(z, z, t_p)
-    same.backward()
-    assert math.isfinite(float(same.detach()))
-    print('hydra ok', float(loss))
+    assert math.isfinite(float(loss.detach()))
+    print('hydra ok', float(loss.detach()))
 
 
 class iBOTLoss(nn.Module):
