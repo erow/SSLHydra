@@ -712,6 +712,7 @@ class Hydra(nn.Module):
     def __init__(self, teacher_dim, embed_dim, mlp_dim, temperature, tau, k, strategy):
         super().__init__()
         self.z_norm = nn.LayerNorm(embed_dim)
+        self.t_norm = nn.BatchNorm1d(embed_dim, affine=False)
         self.gate = nn.Sequential(
             nn.Linear(teacher_dim, mlp_dim),
             nn.BatchNorm1d(mlp_dim),
@@ -729,7 +730,7 @@ class Hydra(nn.Module):
     def forward(self, z_s, z_t, t_p):
         same = z_s is z_t
         z_s = self.z_norm(z_s)
-        z_t = z_t.detach()
+        z_t = self.t_norm(z_t.detach())
         t_p = t_p.detach()
         b = z_s.shape[0]
         # Teacher side only. dist.all_gather keeps z_t and t_p in the same rank order.
@@ -793,7 +794,8 @@ def _check_hydra():
     torch.manual_seed(1)
     t_idx = sample_partner(t_p, 'rand', 0.1)
     gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
-    ref = F.cross_entropy(fused_gated_contrast(hydra.z_norm(z_s), z_t, gate) / 0.2, t_idx)
+    ref = F.cross_entropy(
+        fused_gated_contrast(hydra.z_norm(z_s), hydra.t_norm(z_t), gate) / 0.2, t_idx)
     assert torch.allclose(loss, ref), (float(loss), float(ref))
     loss.backward()
     assert z_s.grad is not None and float(z_s.grad.abs().sum()) > 0
