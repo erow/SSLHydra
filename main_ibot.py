@@ -527,11 +527,14 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
                 b = labels.shape[0]
                 if args.global_crops_number < 2:
                     raise RuntimeError("Hydra contrasts two global views")
-                # Backbone [CLS] only. Student view 0, teacher view 1.
+                # Backbone [CLS] only. Each direction pairs one view with the other.
                 t_p = teacher_table.take(idx).cuda(non_blocking=True)
                 cls_s = _cls_token(student_backbone)
                 cls_t = _cls_token(teacher_backbone)
-                loss_hydra = hydra(cls_s[:b], cls_t[b:2 * b], t_p)
+                loss_hydra = (
+                    hydra(cls_s[:b], cls_t[b:2 * b], t_p)
+                    + hydra(cls_s[b:2 * b], cls_t[:b], t_p)
+                ) / 2
                 all_loss['hydra'] = loss_hydra
                 term = args.hydra_weight * loss_hydra
                 loss = term if loss is None else loss + term

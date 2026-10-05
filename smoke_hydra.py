@@ -87,12 +87,15 @@ def _build(args):
     return loader, student, teacher, hydra, table, opt
 
 
-def _view_cls(wrapper, images, masks, view, b):
-    """Backbone [CLS] of one global crop."""
+def _cls(wrapper, images, masks):
     out = wrapper(images) if masks is None else wrapper(images, mask=masks)
     tokens = out[0] if isinstance(out, tuple) else out
-    cls = _cls_token(tokens)
-    return cls[view * b:(view + 1) * b]
+    return _cls_token(tokens)
+
+
+def _view_cls(wrapper, images, masks, view, b):
+    """Backbone [CLS] of one global crop."""
+    return _cls(wrapper, images, masks)[view * b:(view + 1) * b]
 
 
 def _loss(student, teacher, hydra, table, batch, args):
@@ -102,10 +105,13 @@ def _loss(student, teacher, hydra, table, batch, args):
     b = labels.shape[0]
     crops = images[:args.global_crops_number]
     crop_masks = masks[:args.global_crops_number]
-    h_s = _view_cls(student, crops, crop_masks, 0, b)
-    h_t = _view_cls(teacher, crops, None, 1, b)
+    cls_s = _cls(student, crops, crop_masks)
+    cls_t = _cls(teacher, crops, None)
     t_p = table.take(idx).cuda(non_blocking=True)
-    return hydra(h_s, h_t, t_p)
+    return (
+        hydra(cls_s[:b], cls_t[b:2 * b], t_p)
+        + hydra(cls_s[b:2 * b], cls_t[:b], t_p)
+    ) / 2
 
 
 def _gate_line(hydra):
