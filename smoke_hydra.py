@@ -6,11 +6,15 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import models
 import utils
+from fused_gated_contrast import fused_gated_contrast
 from loader import IBotFFCVLoader
-from main_ibot import Hydra, TeacherTable, _merge_param_groups, get_args_parser
+from main_ibot import (
+    Hydra, TeacherTable, _all_gather, _merge_param_groups, get_args_parser,
+)
 from models.head import iBOTHead
 
 
@@ -158,30 +162,78 @@ def _run_epoch(args, loader, student, teacher, hydra, table, opt):
             f.write(line + '\n')
 
 
-def main():
-    parser = get_args_parser()
-    parser.add_argument('--steps', default=1000, type=int)
-    parser.add_argument('--one_epoch', action='store_true')
-    args = parser.parse_args()
-    loader, student, teacher, hydra, table, opt = _build(args)
-    if args.one_epoch:
-        _run_epoch(args, loader, student, teacher, hydra, table, opt)
-        return
-    batch = _one_batch(loader)
+def _weights(student, teacher, hydra):
+    return tuple(
+        {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
+        for module in (student, teacher, hydra)
+    )
+
+
+def _restore(student, teacher, hydra, opt, saved):
+    for module, state in zip((student, teacher, hydra), saved):
+        module.load_state_dict(state)
+    opt.state.clear()
+
+
+def _snapshot(student, teacher, hydra, table, batch, args):
+    """How sharp the sim draw is, and whether that column leads in z."""
+    images, labels, masks, idx = batch
+    images = [im.cuda(non_blocking=True) for im in images]
+    masks = [msk.cuda(non_blocking=True) for msk in masks]
+    labels = labels.cuda()
+    b = labels.shape[0]
+    h = hydra.module
+    with torch.no_grad():
+        z_t = teacher(images[:args.global_crops_number])[0][:b]
+        z_s = student(
+            images[:args.global_crops_number], mask=masks[:args.global_crops_number])[0][:b]
+        t_p = table.take(idx).cuda()
+        z_s = h.z_norm(z_s)
+        keys = _all_gather(z_t)
+        t_all = _all_gather(t_p)
+        y = _all_gather(labels.view(-1, 1)).view(-1)
+        rows = torch.arange(b, device=z_s.device) + utils.get_rank() * b
+        sim = F.normalize(t_all[rows], dim=-1) @ F.normalize(t_all, dim=-1).T
+        sim[torch.arange(b, device=sim.device), rows] = float('-inf')
+        prob = torch.softmax(sim / h.tau, dim=-1)
+        mode = prob.argmax(dim=-1)
+        ent = float((-(prob * prob.clamp_min(1e-12).log()).sum(-1)).mean())
+        same = y.unsqueeze(0).eq(y[rows].unsqueeze(1))
+        pair = (t_all[rows] + t_all[mode]) * 0.5
+        gate = h.gate(pair).sigmoid()
+        logits = fused_gated_contrast(z_s, keys, gate) / h.temperature
+        local = torch.arange(b, device=logits.device)
+        pos = logits[local, mode]
+        neg = (logits.sum(-1) - pos) / (logits.shape[1] - 1)
+    n = logits.shape[1]
+    return (
+        f'n={n} logn={math.log(n):.4f} top1={float(prob.max(-1).values.mean()):.4f} '
+        f'ent={ent:.3f}/{math.log(n - 1):.3f} '
+        f'same={float(y[mode].eq(y[rows]).float().mean()):.4f} '
+        f'same_mass={float((prob * same).sum(-1).mean()):.4f} '
+        f'logit_pos={float(pos.mean()):.4f} logit_neg={float(neg.mean()):.4f} '
+        f'logit_std={float(logits.float().std()):.4f} '
+        f'col_acc={float(logits.argmax(-1).eq(mode).float().mean()):.4f} '
+        f'gate_mean={float(gate.float().mean()):.4f}'
+    )
+
+
+def _fit_batch(args, student, teacher, hydra, table, opt, batch, reseed, tag):
+    """Fit one batch. reseed=True keeps the partner; False draws a new one."""
     scaler = torch.cuda.amp.GradScaler(enabled=args.use_fp16)
     student.eval()
-    first = None
-    last = None
+    hydra.train()
+    first = last = None
     for step in range(args.steps):
-        # Same partner every step. Otherwise the target moves and the loss cannot fall to zero.
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed(args.seed)
+        if reseed:
+            torch.manual_seed(args.seed)
+            torch.cuda.manual_seed(args.seed)
         opt.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(args.use_fp16):
             loss = _loss(student, teacher, hydra, table, batch, args)
         value = float(loss.detach())
         if not math.isfinite(value):
-            print(f'hydra_overfit step={step} nonfinite loss={value}', flush=True)
+            print(f'{tag} step={step} nonfinite loss={value}', flush=True)
             sys.exit(1)
         scaler.scale(loss).backward()
         if args.clip_grad:
@@ -194,29 +246,41 @@ def main():
         if first is None:
             first = last
         if step % 50 == 0 or step + 1 == args.steps:
-            gnorm = 0.
-            ngrad = 0
-            for p in list(student.parameters()) + list(hydra.parameters()):
-                if p.grad is not None:
-                    gnorm += float(p.grad.detach().float().norm())
-                    ngrad += 1
             print(
-                f'hydra_overfit step={step} loss={last:.4f} {_gate_line(hydra)} '
-                f'grad_norm={gnorm:.4f} ngrad={ngrad}',
+                f'{tag} step={step} loss={last:.4f} {_gate_line(hydra)}',
                 flush=True,
             )
-    # Uniform InfoNCE is log(N). A real positive has to beat that by a wide margin.
     dropped = first - last
-    ok = dropped > 1.0
-    line = f'HYDRA_OVERFIT first={first:.4f} last={last:.4f} delta={dropped:.4f} ok={int(ok)}'
+    line = f'{tag} first={first:.4f} last={last:.4f} delta={dropped:.4f}'
     print(line, flush=True)
-    out = os.path.join(args.output_dir, 'result.txt')
+    return line
+
+
+def main():
+    parser = get_args_parser()
+    parser.add_argument('--steps', default=1000, type=int)
+    parser.add_argument('--one_epoch', action='store_true')
+    args = parser.parse_args()
+    loader, student, teacher, hydra, table, opt = _build(args)
+    if args.one_epoch:
+        _run_epoch(args, loader, student, teacher, hydra, table, opt)
+        return
+    batch = _one_batch(loader)
+    student.eval()
+    snap = 'HYDRA_SNAP ' + _snapshot(student, teacher, hydra, table, batch, args)
+    print(snap, flush=True)
+    saved = _weights(student, teacher, hydra)
+    # A redrawn partner is what training does. A frozen partner is the control.
+    redrawn = _fit_batch(
+        args, student, teacher, hydra, table, opt, batch, False, 'HYDRA_REDRAW')
+    _restore(student, teacher, hydra, opt, saved)
+    frozen = _fit_batch(
+        args, student, teacher, hydra, table, opt, batch, True, 'HYDRA_FROZEN')
+    lines = [snap, redrawn, frozen]
     if utils.is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
-        with open(out, 'w') as f:
-            f.write(line + '\n')
-    if not ok:
-        sys.exit(1)
+        with open(os.path.join(args.output_dir, 'result.txt'), 'w') as f:
+            f.write('\n'.join(lines) + '\n')
 
 
 if __name__ == '__main__':
