@@ -362,6 +362,7 @@ def train_ibot(args):
                 name=os.environ.get("WANDB_NAME") or os.environ.get("SLURM_JOB_NAME") or Path(args.output_dir).name,
                 dir=args.output_dir,
                 config=vars(args),
+                sync_tensorboard=True,
             )
         
     # ============ Hydra gate + frozen teacher table ... ============
