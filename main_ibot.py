@@ -173,7 +173,30 @@ def get_args_parser():
         help='Hidden width of the gate MLP.')
     parser.add_argument('--hydra_weight', default=1.0, type=float,
         help='Multiplier on loss_hydra when --loss is hydra or both.')
+    parser.add_argument('--init_ibot', default='', type=str,
+        help='iBOT checkpoint. Copy its teacher weights into the student and teacher. Epoch stays 0.')
     return parser
+
+
+def _init_from_ibot(student, teacher, path):
+    """Copy an iBOT teacher into both networks. Do not restore epoch or optimizer."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    try:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location='cpu')
+    raw = ckpt['teacher'] if isinstance(ckpt, dict) and 'teacher' in ckpt else ckpt
+    state = {k.replace('module.', ''): v for k, v in raw.items()}
+    inc_s = student.module.load_state_dict(state, strict=False)
+    inc_t = teacher.load_state_dict(state, strict=False)
+    if inc_t.missing_keys:
+        raise RuntimeError('teacher checkpoint missing ' + ', '.join(inc_t.missing_keys[:8]))
+    print(
+        f'loaded ibot teacher from {path} '
+        f'student_missing={len(inc_s.missing_keys)} teacher_missing=0',
+        flush=True,
+    )
 
 def train_ibot(args):
     # Numba records builtins.print at import. init_distributed_mode replaces
@@ -396,6 +419,8 @@ def train_ibot(args):
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
+    if args.init_ibot:
+        _init_from_ibot(student, teacher_without_ddp, args.init_ibot)
     if args.load_from:
         ckpt_kwargs = dict(
             student=student,
