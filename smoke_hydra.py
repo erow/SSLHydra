@@ -13,9 +13,9 @@ import utils
 from fused_gated_contrast import fused_gated_contrast
 from loader import IBotFFCVLoader
 from main_ibot import (
-    Hydra, TeacherTable, _all_gather, _grad_norm, _merge_param_groups, get_args_parser,
+    Hydra, TeacherTable, _all_gather, _cls_token, _grad_norm, _merge_param_groups,
+    get_args_parser,
 )
-from models.head import iBOTHead
 
 
 def _one_batch(loader):
@@ -64,16 +64,8 @@ def _build(args):
         return_all_tokens=True,
     )
     embed_dim = student.embed_dim
-    student = utils.MultiCropWrapper(student, iBOTHead(
-        embed_dim, args.out_dim, patch_out_dim=args.patch_out_dim,
-        norm=args.norm_in_head, act=args.act_in_head,
-        norm_last_layer=args.norm_last_layer, shared_head=args.shared_head,
-    ))
-    teacher = utils.MultiCropWrapper(teacher, iBOTHead(
-        embed_dim, args.out_dim, patch_out_dim=args.patch_out_dim,
-        norm=args.norm_in_head, act=args.act_in_head,
-        shared_head=args.shared_head_teacher,
-    ))
+    student = utils.MultiCropWrapper(student, nn.Identity())
+    teacher = utils.MultiCropWrapper(teacher, nn.Identity())
     student, teacher = student.cuda(), teacher.cuda()
     student = nn.parallel.DistributedDataParallel(
         student, device_ids=[args.gpu], find_unused_parameters=True)
@@ -83,7 +75,7 @@ def _build(args):
     teacher.eval()
     table = TeacherTable(args.teacher_cls)
     hydra = Hydra(
-        table.dim, args.out_dim, args.hydra_mlp_dim, args.hydra_temperature,
+        table.dim, embed_dim, args.hydra_mlp_dim, args.hydra_temperature,
         args.hydra_tau, args.hydra_k, args.hydra_pair,
     ).cuda()
     if utils.has_batchnorms(hydra):
@@ -95,17 +87,24 @@ def _build(args):
     return loader, student, teacher, hydra, table, opt
 
 
+def _backbone_cls(wrapper, images, masks, n):
+    out = wrapper(images) if masks is None else wrapper(images, mask=masks)
+    tokens = out[0] if isinstance(out, tuple) else out
+    return _cls_token(tokens)[:n]
+
+
 def _loss(student, teacher, hydra, table, batch, args):
     images, labels, masks, idx = batch
     images = [im.cuda(non_blocking=True) for im in images]
     masks = [msk.cuda(non_blocking=True) for msk in masks]
     b = labels.shape[0]
+    crops = images[:args.global_crops_number]
+    crop_masks = masks[:args.global_crops_number]
     with torch.no_grad():
-        teacher_output = teacher(images[:args.global_crops_number])
-    student_output = student(
-        images[:args.global_crops_number], mask=masks[:args.global_crops_number])
+        h_t = _backbone_cls(teacher, crops, None, b)
+    h_s = _backbone_cls(student, crops, crop_masks, b)
     t_p = table.take(idx).cuda(non_blocking=True)
-    return hydra(student_output[0][:b], teacher_output[0][:b], t_p)
+    return hydra(h_s, h_t, t_p)
 
 
 def _gate_line(hydra):
@@ -184,11 +183,13 @@ def _snapshot(student, teacher, hydra, table, batch, args):
     b = labels.shape[0]
     h = hydra.module
     with torch.no_grad():
-        z_t = teacher(images[:args.global_crops_number])[0][:b]
-        z_s = student(
-            images[:args.global_crops_number], mask=masks[:args.global_crops_number])[0][:b]
+        crops = images[:args.global_crops_number]
+        h_t = _backbone_cls(teacher, crops, None, b)
+        h_s = _backbone_cls(
+            student, crops, masks[:args.global_crops_number], b)
         t_p = table.take(idx).cuda()
-        z_s = h.z_norm(z_s)
+        z_s = h.predictor(h.projector(h_s))
+        z_t = h.projector(h_t)
         keys = _all_gather(z_t)
         t_all = _all_gather(t_p)
         y = _all_gather(labels.view(-1, 1)).view(-1)

@@ -269,27 +269,20 @@ def train_ibot(args):
     else:
         print(f"Unknow architecture: {args.arch}")
 
-    # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(student, iBOTHead(
-        embed_dim,
-        args.out_dim,
-        patch_out_dim=args.patch_out_dim,
-        norm=args.norm_in_head,
-        act=args.act_in_head,
-        norm_last_layer=args.norm_last_layer,
-        shared_head=args.shared_head,
-    ))
-    teacher = utils.MultiCropWrapper(
-        teacher,
-        iBOTHead(
-            embed_dim, 
-            args.out_dim,
-            patch_out_dim=args.patch_out_dim,
-            norm=args.norm_in_head,
-            act=args.act_in_head,
-            shared_head=args.shared_head_teacher,
-        ),
-    )
+    # Hydra reads the backbone [CLS]. The iBOT head is only for the iBOT loss.
+    def _ibot_head(shared):
+        return iBOTHead(
+            embed_dim, args.out_dim, patch_out_dim=args.patch_out_dim,
+            norm=args.norm_in_head, act=args.act_in_head,
+            norm_last_layer=args.norm_last_layer, shared_head=shared,
+        )
+    if args.loss == 'hydra':
+        student_head, teacher_head = nn.Identity(), nn.Identity()
+    else:
+        student_head = _ibot_head(args.shared_head)
+        teacher_head = _ibot_head(args.shared_head_teacher)
+    student = utils.MultiCropWrapper(student, student_head)
+    teacher = utils.MultiCropWrapper(teacher, teacher_head)
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -353,7 +346,7 @@ def train_ibot(args):
         teacher_table = TeacherTable(args.teacher_cls)
         hydra = Hydra(
             teacher_table.dim,
-            args.out_dim,
+            embed_dim,
             args.hydra_mlp_dim,
             args.hydra_temperature,
             args.hydra_tau,
@@ -502,8 +495,16 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             # get global views
-            teacher_output = teacher(images[:args.global_crops_number])
-            student_output = student(images[:args.global_crops_number], mask=masks[:args.global_crops_number])
+            crops = images[:args.global_crops_number]
+            crop_masks = masks[:args.global_crops_number]
+            if args.loss == 'both':
+                teacher_tokens, teacher_output = teacher(crops, return_backbone_feat=True)
+                student_tokens, student_output = student(
+                    crops, mask=crop_masks, return_backbone_feat=True)
+            else:
+                teacher_output = teacher(crops)
+                student_output = student(crops, mask=crop_masks)
+                teacher_tokens = student_tokens = None
             
             # get local views
             student.module.backbone.masked_im_modeling = False
@@ -519,9 +520,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
                 if idx is None:
                     raise RuntimeError("Hydra needs the FFCV sample index; use an .ffcv data_path")
                 b = labels.shape[0]
-                # First global crop: one latent per image. Student and momentum teacher.
+                # First global crop. Backbone [CLS], not the iBOT head.
                 t_p = teacher_table.take(idx).cuda(non_blocking=True)
-                loss_hydra = hydra(student_output[0][:b], teacher_output[0][:b], t_p)
+                if args.loss == 'hydra':
+                    h_s, h_t = student_output, teacher_output
+                else:
+                    h_s, h_t = student_tokens, teacher_tokens
+                loss_hydra = hydra(_cls_token(h_s)[:b], _cls_token(h_t)[:b], t_p)
                 all_loss['hydra'] = loss_hydra
                 term = args.hydra_weight * loss_hydra
                 loss = term if loss is None else loss + term
@@ -530,12 +535,17 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             print("Loss is {}, stopping training".format(loss.item()), force=True)
             sys.exit(1)
 
-        # log statistics
-        probs1 = teacher_output[0].chunk(args.global_crops_number)
-        probs2 = student_output[0].chunk(args.global_crops_number)
-        pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1]) 
-        pred2 = utils.concat_all_gather(probs2[1].max(dim=1)[1])
-        acc = (pred1 == pred2).sum() / pred1.size(0)
+        # log statistics. The prototype argmax exists only with an iBOT head.
+        if isinstance(teacher_output, tuple) and teacher_output[0].ndim == 2:
+            probs1 = teacher_output[0].chunk(args.global_crops_number)
+            probs2 = student_output[0].chunk(args.global_crops_number)
+            pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1])
+            pred2 = utils.concat_all_gather(probs2[1].max(dim=1)[1])
+            acc = (pred1 == pred2).sum() / pred1.size(0)
+        else:
+            pred1 = utils.concat_all_gather(torch.zeros(
+                labels.shape[0], dtype=torch.long, device=labels.device if labels.is_cuda else 'cuda'))
+            acc = 0.0
         pred_labels.append(pred1)
         real_labels.append(utils.concat_all_gather(labels.to(pred1.device)))
 
@@ -706,13 +716,27 @@ def sample_partner(t_p, strategy, tau):
     return _sample_rows(t_p, torch.arange(b, device=t_p.device), strategy, tau)
 
 
+def _cls_token(tokens):
+    """Backbone tokens are [B, 1+N, C]. The [CLS] token is index 0."""
+    return tokens[:, 0] if tokens.ndim == 3 else tokens
+
+
 class Hydra(nn.Module):
-    """Gate from the averaged teacher pair, then K gated InfoNCE steps."""
+    """Own projector and predictor on backbone [CLS], then gated InfoNCE."""
 
     def __init__(self, teacher_dim, embed_dim, mlp_dim, temperature, tau, k, strategy):
         super().__init__()
-        self.z_norm = nn.LayerNorm(embed_dim)
-        self.t_norm = nn.BatchNorm1d(embed_dim, affine=False)
+
+        def mlp(last):
+            return nn.Sequential(
+                nn.Linear(embed_dim, mlp_dim),
+                nn.GELU(),
+                nn.Linear(mlp_dim, embed_dim),
+                last,
+            )
+
+        self.projector = mlp(nn.LayerNorm(embed_dim))
+        self.predictor = mlp(nn.BatchNorm1d(embed_dim, affine=False))
         self.gate = nn.Sequential(
             nn.Linear(teacher_dim, mlp_dim),
             nn.BatchNorm1d(mlp_dim),
@@ -727,10 +751,10 @@ class Hydra(nn.Module):
         self.force_ones = False
         self.monitor = {}
 
-    def forward(self, z_s, z_t, t_p):
-        same = z_s is z_t
-        z_s = self.z_norm(z_s)
-        z_t = self.t_norm(z_t.detach())
+    def forward(self, h_s, h_t, t_p):
+        same = h_s is h_t
+        z_s = self.predictor(self.projector(h_s))
+        z_t = self.projector(h_t).detach()
         t_p = t_p.detach()
         b = z_s.shape[0]
         # Teacher side only. dist.all_gather keeps z_t and t_p in the same rank order.
@@ -794,11 +818,14 @@ def _check_hydra():
     torch.manual_seed(1)
     t_idx = sample_partner(t_p, 'rand', 0.1)
     gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
-    ref = F.cross_entropy(
-        fused_gated_contrast(hydra.z_norm(z_s), hydra.t_norm(z_t), gate) / 0.2, t_idx)
+    z_q = hydra.predictor(hydra.projector(z_s))
+    z_k = hydra.projector(z_t)
+    ref = F.cross_entropy(fused_gated_contrast(z_q, z_k, gate) / 0.2, t_idx)
     assert torch.allclose(loss, ref), (float(loss), float(ref))
     loss.backward()
     assert z_s.grad is not None and float(z_s.grad.abs().sum()) > 0
+    assert hydra.projector[0].weight.grad is not None
+    assert hydra.predictor[0].weight.grad is not None
     assert hydra.gate[0].weight.grad is not None
     assert t_p.grad is None
     z = torch.randn(b, d, requires_grad=True)
