@@ -544,6 +544,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         param_norms = None
         if fp16_scaler is None:
             loss.backward()
+            gnorm = _grad_norm(student, hydra)
             if args.clip_grad:
                 param_norms = utils.clip_gradients(student, args.clip_grad)
                 if hydra is not None:
@@ -553,8 +554,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             optimizer.step()
         else:
             fp16_scaler.scale(loss).backward()
+            fp16_scaler.unscale_(optimizer)
+            gnorm = _grad_norm(student, hydra)
             if args.clip_grad:
-                fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 param_norms = utils.clip_gradients(student, args.clip_grad)
                 if hydra is not None:
                     utils.clip_gradients(hydra, args.clip_grad)
@@ -577,6 +579,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
         metric_logger.update(acc=acc)
+        metric_logger.update(gnorm=gnorm)
+        if hydra is not None:
+            metric_logger.update(**hydra.module.monitor)
         if args.max_steps and local_it + 1 >= args.max_steps:
             break
 
@@ -662,6 +667,39 @@ def _sample_rows(t_all, rows, strategy, tau):
     return torch.multinomial(torch.softmax(m / tau, dim=-1), 1).squeeze(1)
 
 
+def _hydra_monitor(z_s, keys, t_all, rows, logits, tau_s):
+    """Reference cross-entropy, plus how spread the two latents are."""
+    with torch.no_grad():
+        ref = F.normalize(t_all.float(), dim=-1)
+        sample_sim = ref @ ref.T
+        # y indexes this rank's queries into the gathered reference.
+        graph = sample_sim[rows[:, None], torch.arange(sample_sim.shape[1], device=sample_sim.device)]
+        self_mask = torch.zeros_like(graph, dtype=torch.bool)
+        self_mask[torch.arange(graph.shape[0], device=graph.device), rows] = True
+        graph = (graph / tau_s).masked_fill(self_mask, float('-inf'))
+        log_p = logits.detach().float().log_softmax(dim=1).masked_fill(self_mask, 0)
+        p_ref = graph.softmax(dim=1)
+        ref_h = -(p_ref * log_p).sum(dim=1).mean()
+        ref_ent = -(p_ref * p_ref.clamp_min(1e-12).log()).sum(dim=1).mean()
+        return {
+            'ref_h': float(ref_h),
+            'ref_ent': float(ref_ent),
+            'zs_std': float(z_s.detach().float().std(dim=0, unbiased=False).mean()),
+            'zt_std': float(keys.detach().float().std(dim=0, unbiased=False).mean()),
+        }
+
+
+def _grad_norm(*models):
+    sq = 0.0
+    for model in models:
+        if model is None:
+            continue
+        for p in model.parameters():
+            if p.grad is not None:
+                sq += float(p.grad.detach().float().pow(2).sum())
+    return sq ** 0.5
+
+
 def sample_partner(t_p, strategy, tau):
     """Partner index inside this tensor. Never the row itself."""
     b = t_p.shape[0]
@@ -684,6 +722,9 @@ class Hydra(nn.Module):
         self.tau = tau
         self.k = k
         self.strategy = strategy
+        # Experiment switch: a constant gate ignores t_p when choosing the subspace.
+        self.force_ones = False
+        self.monitor = {}
 
     def forward(self, z_s, z_t, t_p):
         same = z_s is z_t
@@ -701,7 +742,9 @@ class Hydra(nn.Module):
             with torch.no_grad():
                 t_idx = _sample_rows(t_all, rows, self.strategy, self.tau)
             pair = (t_all[rows] + t_all[t_idx]) * 0.5
-            gate = self.gate(pair).sigmoid()
+            raw = self.gate(pair).sigmoid()
+            # raw * 0 keeps the gate parameters in the DDP graph when the ablation is on.
+            gate = raw if not self.force_ones else raw * 0 + 1
             with torch.no_grad():
                 g = gate.detach().float()
                 self.gate_stats = {
@@ -716,6 +759,7 @@ class Hydra(nn.Module):
                 logits = logits.clone()
                 logits[local, local + offset] = float('-inf')
             total = total + F.cross_entropy(logits, t_idx)
+        self.monitor = _hydra_monitor(z_s, keys, t_all, rows, logits, self.tau)
         return total / self.k
 
 

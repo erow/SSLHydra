@@ -13,7 +13,7 @@ import utils
 from fused_gated_contrast import fused_gated_contrast
 from loader import IBotFFCVLoader
 from main_ibot import (
-    Hydra, TeacherTable, _all_gather, _merge_param_groups, get_args_parser,
+    Hydra, TeacherTable, _all_gather, _grad_norm, _merge_param_groups, get_args_parser,
 )
 from models.head import iBOTHead
 
@@ -256,14 +256,118 @@ def _fit_batch(args, student, teacher, hydra, table, opt, batch, reseed, tag):
     return line
 
 
+def _monitor_line(hydra, gnorm):
+    m = hydra.module.monitor
+    return (
+        f"ref_h={m['ref_h']:.4f} ref_ent={m['ref_ent']:.4f} "
+        f"zs_std={m['zs_std']:.4f} zt_std={m['zt_std']:.4f} gnorm={gnorm:.4f}"
+    )
+
+
+def _stream(args, loader, student, teacher, hydra, table, opt, steps, tag):
+    """New images every step, as in training. Returns the summary line."""
+    loader.set_epoch(0)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.use_fp16)
+    student.train()
+    hydra.train()
+    first = last = None
+    for step, batch in enumerate(loader):
+        if step >= steps:
+            break
+        opt.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(args.use_fp16):
+            loss = _loss(student, teacher, hydra, table, batch, args)
+        value = float(loss.detach())
+        if not math.isfinite(value):
+            print(f'{tag} step={step} nonfinite loss={value}', flush=True)
+            sys.exit(1)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        gnorm = _grad_norm(student, hydra)
+        if args.clip_grad:
+            utils.clip_gradients(student, args.clip_grad)
+            utils.clip_gradients(hydra, args.clip_grad)
+        scaler.step(opt)
+        scaler.update()
+        last = value
+        if first is None:
+            first = last
+        if step % 20 == 0 or step + 1 == steps:
+            print(
+                f'{tag} step={step} loss={last:.4f} {_monitor_line(hydra, gnorm)}',
+                flush=True,
+            )
+    line = (
+        f'{tag} first={first:.4f} last={last:.4f} delta={first - last:.4f} '
+        f'{_monitor_line(hydra, gnorm)}'
+    )
+    print(line, flush=True)
+    return line
+
+
+def _load_ibot(student, teacher):
+    """Start from the iBOT teacher that wrote the reference table."""
+    dest = os.path.join(
+        os.environ.get('TORCH_HOME', '/scratch/project_465003400/cache/torch'),
+        'ibot', 'vitb_16_rand_mask_checkpoint.pth')
+    if not os.path.isfile(dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        url = (
+            'https://lf3-nlp-opensource.bytetos.com/obj/nlp-opensource/'
+            'archive/2022/ibot/vitb_16_rand_mask/checkpoint.pth')
+        torch.hub.download_url_to_file(url, dest)
+    try:
+        ckpt = torch.load(dest, map_location='cpu', weights_only=False)
+    except TypeError:
+        ckpt = torch.load(dest, map_location='cpu')
+    state = {k.replace('module.', ''): v for k, v in ckpt['teacher'].items()}
+    inc_s = student.module.load_state_dict(state, strict=False)
+    inc_t = teacher.load_state_dict(state, strict=False)
+    if inc_t.missing_keys:
+        raise RuntimeError('teacher checkpoint missing ' + ', '.join(inc_t.missing_keys[:8]))
+    print(
+        f'loaded ibot teacher from {dest} '
+        f'student_missing={len(inc_s.missing_keys)} teacher_missing=0',
+        flush=True,
+    )
+
+
+def _run_why(args, loader, student, teacher, hydra, table, opt):
+    """H1: constant gate. H2: iBOT initialization. Same stream length for each."""
+    saved = _weights(student, teacher, hydra)
+    lines = []
+    runs = (
+        ('WHY_SCRATCH', False, False),
+        ('WHY_ONES', True, False),
+        ('WHY_IBOT', False, True),
+    )
+    for tag, force_ones, use_ibot in runs:
+        _restore(student, teacher, hydra, opt, saved)
+        if use_ibot:
+            _load_ibot(student, teacher)
+            opt.state.clear()
+        hydra.module.force_ones = force_ones
+        lines.append(_stream(
+            args, loader, student, teacher, hydra, table, opt, args.why_steps, tag))
+    if utils.is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, 'result.txt'), 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+
+
 def main():
     parser = get_args_parser()
     parser.add_argument('--steps', default=1000, type=int)
     parser.add_argument('--one_epoch', action='store_true')
+    parser.add_argument('--why', action='store_true')
+    parser.add_argument('--why_steps', default=60, type=int)
     args = parser.parse_args()
     loader, student, teacher, hydra, table, opt = _build(args)
     if args.one_epoch:
         _run_epoch(args, loader, student, teacher, hydra, table, opt)
+        return
+    if args.why:
+        _run_why(args, loader, student, teacher, hydra, table, opt)
         return
     batch = _one_batch(loader)
     student.eval()
