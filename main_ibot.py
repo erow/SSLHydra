@@ -644,19 +644,39 @@ def _merge_param_groups(student_groups, hydra_groups):
     ]
 
 
-def _stats_along_samples(table, chunk=4096):
+def _stats_along_samples(table, chunk=65536):
     """Mean and std of each column, reduced over the sample axis."""
     n, d = table.shape
     total = np.zeros(d, dtype=np.float64)
     sq = np.zeros(d, dtype=np.float64)
     for start in range(0, n, chunk):
-        x = np.asarray(table[start:start + chunk], dtype=np.float64)
-        total += x.sum(axis=0)
-        sq += np.square(x).sum(axis=0)
+        x = np.asarray(table[start:start + chunk], dtype=np.float32)
+        total += x.sum(axis=0, dtype=np.float64)
+        sq += np.square(x, dtype=np.float64).sum(axis=0)
     mean = total / n
     var = sq / n - np.square(mean)
     std = np.sqrt(np.maximum(var, 1e-12))
     return mean.astype(np.float32), std.astype(np.float32)
+
+
+def _teacher_column_stats(table, path):
+    """Column mean and std. Rank 0 writes a cache; the other ranks only read it."""
+    cache = os.path.splitext(path)[0] + '.colstats.npz'
+    if os.path.isfile(cache):
+        saved = np.load(cache)
+        return saved['mean'], saved['std']
+    distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    if not distributed or dist.get_rank() == 0:
+        print(f'teacher table stats: {table.shape[0]} rows -> {cache}', flush=True)
+        mean, std = _stats_along_samples(table)
+        tmp = cache + '.tmp.npz'
+        np.savez(tmp, mean=mean, std=std)
+        os.replace(tmp, cache)
+        print('teacher table stats ready', flush=True)
+    if distributed:
+        dist.barrier()
+    saved = np.load(cache)
+    return saved['mean'], saved['std']
 
 
 class TeacherTable:
@@ -671,7 +691,7 @@ class TeacherTable:
             raise FileNotFoundError(path)
         self.table = np.load(path, mmap_mode='r')
         self.dim = int(self.table.shape[1])
-        self.mean, self.std = _stats_along_samples(self.table)
+        self.mean, self.std = _teacher_column_stats(self.table, path)
 
     def take(self, idx):
         rows = np.asarray(self.table[idx.numpy()], dtype=np.float32)
