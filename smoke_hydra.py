@@ -98,13 +98,17 @@ def _view_cls(wrapper, images, masks, view, b):
     return _cls(wrapper, images, masks)[view * b:(view + 1) * b]
 
 
-def _loss(student, teacher, hydra, table, batch, args):
+def _loss(student, teacher, hydra, table, batch, args, freeze_student=False):
     images, labels, masks, idx = batch
     images = [im.cuda(non_blocking=True) for im in images]
     masks = [msk.cuda(non_blocking=True) for msk in masks]
     crops = images[:args.global_crops_number]
     crop_masks = masks[:args.global_crops_number]
-    cls_s = _cls(student, crops, crop_masks)
+    if freeze_student:
+        with torch.no_grad():
+            cls_s = _cls(student, crops, crop_masks)
+    else:
+        cls_s = _cls(student, crops, crop_masks)
     cls_t = _cls(teacher, crops, None)
     t_p = table.take(idx).cuda(non_blocking=True)
     return hydra(cls_s, cls_t, t_p)
@@ -267,19 +271,31 @@ def _monitor_line(hydra, gnorm):
     )
 
 
-def _stream(args, loader, student, teacher, hydra, table, opt, steps, tag):
-    """New images every step, as in training. Returns the summary line."""
+def _stream(args, loader, student, teacher, hydra, table, opt, steps, tag, warmup_steps=0):
+    """New images every step, as in training. Returns the summary line.
+
+    The first ``warmup_steps`` update only Hydra. The backbone stays eval and
+    out of the graph, then the remaining steps train both.
+    """
     loader.set_epoch(0)
     scaler = torch.cuda.amp.GradScaler(enabled=args.use_fp16)
     student.train()
     hydra.train()
-    first = last = None
+    first = last = at_warmup = None
     for step, batch in enumerate(loader):
         if step >= steps:
             break
+        hydra_only = step < warmup_steps
+        if hydra_only and step == 0:
+            student.eval()
+            student.requires_grad_(False)
+        elif warmup_steps and step == warmup_steps:
+            student.train()
+            student.requires_grad_(True)
         opt.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(args.use_fp16):
-            loss = _loss(student, teacher, hydra, table, batch, args)
+            loss = _loss(
+                student, teacher, hydra, table, batch, args, freeze_student=hydra_only)
         value = float(loss.detach())
         if not math.isfinite(value):
             print(f'{tag} step={step} nonfinite loss={value}', flush=True)
@@ -295,13 +311,20 @@ def _stream(args, loader, student, teacher, hydra, table, opt, steps, tag):
         last = value
         if first is None:
             first = last
-        if step % 20 == 0 or step + 1 == steps:
+        if hydra_only and step + 1 == warmup_steps:
+            at_warmup = value
+        phase = 'warmup' if hydra_only else 'full'
+        boundary = warmup_steps and step + 1 == warmup_steps
+        if step % 20 == 0 or step + 1 == steps or boundary:
             print(
-                f'{tag} step={step} loss={last:.4f} {_monitor_line(hydra, gnorm)}',
+                f'{tag} step={step} phase={phase} loss={last:.4f} '
+                f'{_monitor_line(hydra, gnorm)}',
                 flush=True,
             )
+    warm = f' at_warmup={at_warmup:.4f}' if at_warmup is not None else ''
     line = (
-        f'{tag} first={first:.4f} last={last:.4f} delta={first - last:.4f} '
+        f'{tag} warmup={warmup_steps} first={first:.4f}{warm} '
+        f'last={last:.4f} delta={first - last:.4f} '
         f'{_monitor_line(hydra, gnorm)}'
     )
     print(line, flush=True)
@@ -358,14 +381,38 @@ def _run_why(args, loader, student, teacher, hydra, table, opt):
             f.write('\n'.join(lines) + '\n')
 
 
+def _run_warmup(args, loader, student, teacher, hydra, table, opt):
+    """Scratch init, learned gate. Warmup fits Hydra, then both train."""
+    hydra.module.force_ones = False
+    total = args.warmup_steps + args.steps
+    print(
+        f'WARMUP_SCRATCH init=scratch gate=learnable '
+        f'warmup_steps={args.warmup_steps} full_steps={args.steps}',
+        flush=True,
+    )
+    line = _stream(
+        args, loader, student, teacher, hydra, table, opt, total,
+        'WARMUP_SCRATCH', warmup_steps=args.warmup_steps,
+    )
+    if utils.is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, 'result.txt'), 'w') as f:
+            f.write(line + '\n')
+
+
 def main():
     parser = get_args_parser()
     parser.add_argument('--steps', default=1000, type=int)
+    parser.add_argument('--warmup', action='store_true')
+    parser.add_argument('--warmup_steps', default=100, type=int)
     parser.add_argument('--one_epoch', action='store_true')
     parser.add_argument('--why', action='store_true')
     parser.add_argument('--why_steps', default=60, type=int)
     args = parser.parse_args()
     loader, student, teacher, hydra, table, opt = _build(args)
+    if args.warmup:
+        _run_warmup(args, loader, student, teacher, hydra, table, opt)
+        return
     if args.one_epoch:
         _run_epoch(args, loader, student, teacher, hydra, table, opt)
         return
