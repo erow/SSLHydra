@@ -724,6 +724,16 @@ def sample_partner(t_p, strategy, tau):
     return _sample_rows(t_p, torch.arange(b, device=t_p.device), strategy, tau)
 
 
+def _clone_bn_buffers(module):
+    for m in module.modules():
+        if not isinstance(m, nn.modules.batchnorm._BatchNorm) or m.running_mean is None:
+            continue
+        m.running_mean = m.running_mean.detach().clone()
+        m.running_var = m.running_var.detach().clone()
+        if m.num_batches_tracked is not None:
+            m.num_batches_tracked = m.num_batches_tracked.detach().clone()
+
+
 def _cls_token(tokens):
     """Backbone tokens are [B, 1+N, C]. The [CLS] token is index 0."""
     return tokens[:, 0] if tokens.ndim == 3 else tokens
@@ -760,6 +770,9 @@ class Hydra(nn.Module):
         self.monitor = {}
 
     def forward(self, h_s, h_t, t_p):
+        # Two directions share one backward. Batch-norm updates its buffers
+        # in place, which would bump a tensor saved by the other direction.
+        _clone_bn_buffers(self)
         same = h_s is h_t
         z_s = self.predictor(self.projector(h_s))
         z_t = self.projector(h_t)
@@ -831,6 +844,8 @@ def _check_hydra():
     ref = F.cross_entropy(fused_gated_contrast(z_q, z_k, gate) / 0.2, t_idx)
     assert torch.allclose(loss, ref), (float(loss), float(ref))
     loss.backward()
+    both = (hydra(z_s, z_t, t_p) + hydra(z_t, z_s, t_p)) / 2
+    both.backward()
     assert z_s.grad is not None and float(z_s.grad.abs().sum()) > 0
     assert z_t.grad is not None and float(z_t.grad.abs().sum()) > 0
     assert hydra.projector[0].weight.grad is not None
