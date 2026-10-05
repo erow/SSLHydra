@@ -6,6 +6,7 @@
 
 import argparse
 import os
+import shutil
 import sys
 import datetime
 import time
@@ -691,8 +692,35 @@ def _teacher_column_stats(table, path):
     return saved['mean'], saved['std']
 
 
+def _stage_teacher_table(path):
+    """Copy the table onto this node's tmpfs, then random-read it from there.
+
+    ``/tmp`` is per node, so local rank 0 on each node copies once. A size match
+    skips the copy. ponytail: same filename and byte size is treated as the same
+    table; hash the file if two different tables can share a name.
+    """
+    staged = os.path.join("/tmp", os.path.basename(path))
+    if os.path.abspath(path) == os.path.abspath(staged):
+        return path
+    src_size = os.path.getsize(path)
+    distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
+    ready = os.path.isfile(staged) and os.path.getsize(staged) == src_size
+    if local_rank == 0 and not ready:
+        print(f'stage teacher table: {path} -> {staged}', flush=True)
+        tmp = staged + ".tmp"
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, staged)
+        print('teacher table staged', flush=True)
+    if distributed:
+        dist.barrier()
+    if not (os.path.isfile(staged) and os.path.getsize(staged) == src_size):
+        raise FileNotFoundError(staged)
+    return staged
+
+
 class TeacherTable:
-    """CPU memmap of frozen teacher vectors. Copies one batch per step.
+    """Frozen teacher vectors on node tmpfs. Copies one batch per step.
 
     Rows are z-scored along the sample axis: each dimension has mean 0 and
     std 1 over the full table, so a shared direction does not dominate.
@@ -701,7 +729,8 @@ class TeacherTable:
     def __init__(self, path):
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
-        self.table = np.load(path, mmap_mode='r')
+        staged = _stage_teacher_table(path)
+        self.table = np.load(staged, mmap_mode='r')
         self.dim = int(self.table.shape[1])
         self.mean, self.std = _teacher_column_stats(self.table, path)
 
