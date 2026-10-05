@@ -73,9 +73,14 @@ def _build(args):
     for p in teacher.parameters():
         p.requires_grad = False
     teacher.eval()
-    table = TeacherTable(args.teacher_cls)
+    if args.hydra_pair == 'label':
+        table = None
+        teacher_dim = 0
+    else:
+        table = TeacherTable(args.teacher_cls)
+        teacher_dim = table.dim
     hydra = Hydra(
-        table.dim, embed_dim, args.hydra_mlp_dim, args.hydra_temperature,
+        teacher_dim, embed_dim, args.hydra_mlp_dim, args.hydra_temperature,
         args.hydra_tau, args.hydra_k, args.hydra_pair,
     ).cuda()
     if utils.has_batchnorms(hydra):
@@ -110,8 +115,11 @@ def _loss(student, teacher, hydra, table, batch, args, freeze_student=False):
     else:
         cls_s = _cls(student, crops, crop_masks)
     cls_t = _cls(teacher, crops, None)
-    t_p = table.take(idx).cuda(non_blocking=True)
-    return hydra(cls_s, cls_t, t_p)
+    if args.hydra_pair == 'label':
+        guide = labels.cuda(non_blocking=True)
+    else:
+        guide = table.take(idx).cuda(non_blocking=True)
+    return hydra(cls_s, cls_t, guide)
 
 
 def _gate_line(hydra):
@@ -268,6 +276,7 @@ def _monitor_line(hydra, gnorm):
     return (
         f"ref_h={m['ref_h']:.4f} ref_ent={m['ref_ent']:.4f} "
         f"zs_std={m['zs_std']:.4f} zt_std={m['zt_std']:.4f} gnorm={gnorm:.4f}"
+        + (f" hit={m['hit']:.3f}" if 'hit' in m else '')
     )
 
 
@@ -410,6 +419,16 @@ def main():
     parser.add_argument('--why_steps', default=60, type=int)
     args = parser.parse_args()
     loader, student, teacher, hydra, table, opt = _build(args)
+    if args.hydra_pair == 'label' and not (args.warmup or args.one_epoch or args.why):
+        hydra.module.force_ones = False
+        print('LABEL_SCRATCH init=scratch gate=learnable pair=label', flush=True)
+        line = _stream(
+            args, loader, student, teacher, hydra, table, opt, args.steps, 'LABEL_SCRATCH')
+        if utils.is_main_process():
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(os.path.join(args.output_dir, 'result.txt'), 'w') as f:
+                f.write(line + '\n')
+        return
     if args.warmup:
         _run_warmup(args, loader, student, teacher, hydra, table, opt)
         return

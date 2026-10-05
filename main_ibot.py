@@ -168,8 +168,8 @@ def get_args_parser():
         help='InfoNCE temperature. Distinct from --hydra_tau.')
     parser.add_argument('--hydra_k', default=1, type=int,
         help='Number of partner draws / subspaces averaged into loss_hydra.')
-    parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand', 'self'],
-        help='Partner index: teacher similarity, uniform over the other rows, or the same sample.')
+    parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand', 'self', 'label'],
+        help='Partner index: teacher similarity, uniform, the same sample, or another image of the same class.')
     parser.add_argument('--hydra_mlp_dim', default=1024, type=int,
         help='Hidden width of the gate MLP.')
     parser.add_argument('--hydra_weight', default=1.0, type=float,
@@ -380,9 +380,14 @@ def train_ibot(args):
     # ============ Hydra gate + frozen teacher table ... ============
     use_hydra = args.loss in ('hydra', 'both')
     if use_hydra:
-        teacher_table = TeacherTable(args.teacher_cls)
+        if args.hydra_pair == 'label':
+            teacher_table = None
+            teacher_dim = 0
+        else:
+            teacher_table = TeacherTable(args.teacher_cls)
+            teacher_dim = teacher_table.dim
         hydra = Hydra(
-            teacher_table.dim,
+            teacher_dim,
             embed_dim,
             args.hydra_mlp_dim,
             args.hydra_temperature,
@@ -560,15 +565,18 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
                 all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
                 loss = all_loss.pop('loss')
             if args.loss in ('hydra', 'both'):
-                if idx is None:
-                    raise RuntimeError("Hydra needs the FFCV sample index; use an .ffcv data_path")
                 if args.global_crops_number < 2:
                     raise RuntimeError("Hydra contrasts two global views")
                 # Backbone [CLS] of both global views. Hydra chunks after the norm.
-                t_p = teacher_table.take(idx).cuda(non_blocking=True)
+                if args.hydra_pair == 'label':
+                    guide = labels.cuda(non_blocking=True)
+                else:
+                    if idx is None:
+                        raise RuntimeError("Hydra needs the FFCV sample index; use an .ffcv data_path")
+                    guide = teacher_table.take(idx).cuda(non_blocking=True)
                 cls_s = _cls_token(student_backbone)
                 cls_t = _cls_token(teacher_backbone)
-                loss_hydra = hydra(cls_s, cls_t, t_p)
+                loss_hydra = hydra(cls_s, cls_t, guide)
                 all_loss['hydra'] = loss_hydra
                 term = args.hydra_weight * loss_hydra
                 loss = term if loss is None else loss + term
@@ -751,6 +759,44 @@ def _all_gather(tensor):
     return torch.cat(parts, dim=0)
 
 
+def _label_partner(labels, rows):
+    """Another gathered key with the same class. ``has`` is false when this class appears once."""
+    b = rows.shape[0]
+    same = labels.unsqueeze(0).eq(labels[rows].unsqueeze(1))
+    same[torch.arange(b, device=same.device), rows] = False
+    has = same.any(dim=1)
+    weights = same.float()
+    # Empty rows need a positive weight so multinomial is defined. Those anchors are not in the loss.
+    empty = torch.arange(b, device=same.device)[~has]
+    if empty.numel():
+        weights[empty, rows[empty]] = 1
+    return torch.multinomial(weights, 1).squeeze(1), has
+
+
+def _label_monitor(z_s, keys, labels, rows, logits, has):
+    """Cross-entropy against a uniform distribution on the same-class keys."""
+    with torch.no_grad():
+        same = labels.unsqueeze(0).eq(labels[rows].unsqueeze(1))
+        same[torch.arange(rows.shape[0], device=same.device), rows] = False
+        weights = same.float()
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1)
+        log_p = logits.detach().float().log_softmax(dim=1)
+        ref_h = -(weights * log_p).sum(dim=1)
+        ref_ent = -(weights * weights.clamp_min(1e-12).log()).sum(dim=1)
+        if has.any():
+            ref_h = float(ref_h[has].mean())
+            ref_ent = float(ref_ent[has].mean())
+        else:
+            ref_h = ref_ent = 0.0
+        return {
+            'ref_h': ref_h,
+            'ref_ent': ref_ent,
+            'zs_std': float(z_s.detach().float().std(dim=0, unbiased=False).mean()),
+            'zt_std': float(keys.detach().float().std(dim=0, unbiased=False).mean()),
+            'hit': float(has.float().mean()),
+        }
+
+
 def _sample_rows(t_all, rows, strategy, tau):
     """Index into ``t_all``. ``self`` is ``rows``; ``sim`` and ``rand`` are not."""
     b = rows.shape[0]
@@ -829,8 +875,11 @@ class Hydra(nn.Module):
 
         self.projector = mlp(nn.LayerNorm(embed_dim))
         self.predictor = mlp(nn.BatchNorm1d(embed_dim, affine=False))
+        # ImageNet class ids replace the 8192-d teacher row. The gate reads that embedding.
+        self.label_embed = nn.Embedding(1000, mlp_dim) if strategy == 'label' else None
+        gate_in = mlp_dim if strategy == 'label' else teacher_dim
         self.gate = nn.Sequential(
-            nn.Linear(teacher_dim, mlp_dim),
+            nn.Linear(gate_in, mlp_dim),
             nn.BatchNorm1d(mlp_dim),
             nn.ReLU(inplace=True),
             nn.Linear(mlp_dim, embed_dim),
@@ -843,19 +892,27 @@ class Hydra(nn.Module):
         self.force_ones = False
         self.monitor = {}
 
-    def _direction(self, z_s, z_t, t_p):
+    def _direction(self, z_s, z_t, guide):
         """One view as the query, the other view as the keys."""
         b = z_s.shape[0]
         keys = gather_with_grad(z_t)
-        t_all = _all_gather(t_p)
+        label = self.strategy == 'label'
+        gathered = _all_gather(guide.long().view(-1) if label else guide)
         offset = utils.get_rank() * b
         rows = torch.arange(b, device=z_s.device) + offset
         total = 0
+        has = None
         for _ in range(self.k):
             with torch.no_grad():
-                t_idx = _sample_rows(t_all, rows, self.strategy, self.tau)
-            pair = (t_all[rows] + t_all[t_idx]) * 0.5
-            raw = self.gate(pair).sigmoid()
+                if label:
+                    t_idx, has = _label_partner(gathered, rows)
+                else:
+                    t_idx = _sample_rows(gathered, rows, self.strategy, self.tau)
+            if label:
+                feat = self.label_embed(gathered[rows])
+            else:
+                feat = (gathered[rows] + gathered[t_idx]) * 0.5
+            raw = self.gate(feat).sigmoid()
             # raw * 0 keeps the gate parameters in the DDP graph when the ablation is on.
             gate = raw if not self.force_ones else raw * 0 + 1
             with torch.no_grad():
@@ -867,20 +924,27 @@ class Hydra(nn.Module):
                     'hi': float((g > 0.95).float().mean()),
                 }
             logits = fused_gated_contrast(z_s, keys, gate) / self.temperature
-            total = total + F.cross_entropy(logits, t_idx)
-        self.monitor = _hydra_monitor(z_s, keys, t_all, rows, logits, self.tau)
+            if label:
+                term = F.cross_entropy(logits[has], t_idx[has]) if has.any() else logits.sum() * 0
+            else:
+                term = F.cross_entropy(logits, t_idx)
+            total = total + term
+        if label:
+            self.monitor = _label_monitor(z_s, keys, gathered, rows, logits, has)
+        else:
+            self.monitor = _hydra_monitor(z_s, keys, gathered, rows, logits, self.tau)
         return total / self.k
 
-    def forward(self, h_s, h_t, t_p):
+    def forward(self, h_s, h_t, guide):
         # Both views share one norm. Chunk only after that.
         z_s = self.predictor(self.projector(h_s))
         z_t = self.projector(h_t)
-        t_p = t_p.detach()
+        guide = guide.detach()
         q0, q1 = z_s.chunk(2, dim=0)
         k0, k1 = z_t.chunk(2, dim=0)
-        loss0 = self._direction(q0, k1, t_p)
+        loss0 = self._direction(q0, k1, guide)
         mon0 = dict(self.monitor)
-        loss1 = self._direction(q1, k0, t_p)
+        loss1 = self._direction(q1, k0, guide)
         self.monitor = {key: (mon0[key] + self.monitor[key]) / 2 for key in mon0}
         return (loss0 + loss1) / 2
 
@@ -904,6 +968,10 @@ def _check_hydra():
     m = m.masked_fill(torch.eye(b, dtype=torch.bool), float('-inf'))
     assert int(torch.softmax(m / 1e-3, dim=-1)[0].argmax()) == 1
     own = torch.arange(b)
+    labels = torch.tensor([0, 0, 1, 2])
+    partner, has = _label_partner(labels, own)
+    assert has.tolist() == [True, True, False, False]
+    assert partner[:2].tolist() == [1, 0]
     assert torch.equal(sample_partner(t_p, 'self', 0.1), own)
     for _ in range(20):
         drawn = sample_partner(t_p, 'rand', 0.1)
