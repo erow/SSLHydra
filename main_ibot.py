@@ -354,8 +354,18 @@ def train_ibot(args):
         local_runs = os.path.join(args.output_dir, 'tf_logs')
         writer = SummaryWriter(log_dir=local_runs)
         if not args.no_wandb:
+            import subprocess
             import wandb
             os.environ.setdefault("WANDB_START_METHOD", "thread")
+            # Job cwd is /tmp/SSLHydra; the clone (and .git) lives in src/.
+            git_root = str(Path(__file__).resolve().parent)
+            settings = {"git_root": git_root}
+            try:
+                settings["git_commit"] = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=git_root, text=True,
+                ).strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
             wandb.init(
                 project=os.environ.get("WANDB_PROJECT", "SSLHydra"),
                 entity=os.environ.get("WANDB_ENTITY") or None,
@@ -363,6 +373,7 @@ def train_ibot(args):
                 dir=args.output_dir,
                 config=vars(args),
                 sync_tensorboard=True,
+                settings=settings,
             )
         
     # ============ Hydra gate + frozen teacher table ... ============
