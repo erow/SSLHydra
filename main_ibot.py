@@ -931,6 +931,9 @@ class Hydra(nn.Module):
             if label:
                 term = F.cross_entropy(logits[has], t_idx[has]) if has.any() else logits.sum() * 0
             else:
+                if self.strategy != 'self':
+                    # The query's other view is not a negative; SimLAP keeps the anchor out of the denominator.
+                    logits = logits.masked_fill(F.one_hot(rows, logits.shape[1]).bool(), float('-inf'))
                 term = F.cross_entropy(logits, t_idx)
             total = total + term
         if label:
@@ -999,7 +1002,8 @@ def _check_hydra():
     def one(q, k):
         t_idx = sample_partner(t_p, 'rand', 0.1)
         gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
-        return F.cross_entropy(fused_gated_contrast(q, k, gate) / 0.2, t_idx)
+        logits = fused_gated_contrast(q, k, gate) / 0.2
+        return F.cross_entropy(logits.masked_fill(torch.eye(b, dtype=torch.bool), float('-inf')), t_idx)
 
     ref = (one(q0, k1) + one(q1, k0)) / 2
     assert torch.allclose(loss, ref), (float(loss), float(ref))
