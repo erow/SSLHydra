@@ -873,8 +873,10 @@ class Hydra(nn.Module):
                 last,
             )
 
-        self.projector = mlp(nn.LayerNorm(embed_dim))
-        self.predictor = mlp(nn.BatchNorm1d(embed_dim, affine=False))
+        # BN on the shared projector centres keys and queries alike (SimLAP bn-ln). With BN only on
+        # the query side, a batch-constant [CLS] is free for the student and collapses the keys.
+        self.projector = mlp(nn.BatchNorm1d(embed_dim, affine=False))
+        self.predictor = mlp(nn.LayerNorm(embed_dim))
         # ImageNet class ids replace the 8192-d teacher row. The gate reads that embedding.
         self.label_embed = nn.Embedding(1000, mlp_dim) if strategy == 'label' else None
         gate_in = mlp_dim if strategy == 'label' else teacher_dim
@@ -912,18 +914,20 @@ class Hydra(nn.Module):
                 feat = self.label_embed(gathered[rows])
             else:
                 feat = (gathered[rows] + gathered[t_idx]) * 0.5
-            raw = self.gate(feat).sigmoid()
-            # raw * 0 keeps the gate parameters in the DDP graph when the ablation is on.
-            gate = raw if not self.force_ones else raw * 0 + 1
-            with torch.no_grad():
-                g = gate.detach().float()
-                self.gate_stats = {
-                    'mean': float(g.mean()),
-                    'std': float(g.std(unbiased=False)),
-                    'lo': float((g < 0.05).float().mean()),
-                    'hi': float((g > 0.95).float().mean()),
-                }
-            logits = fused_gated_contrast(z_s, keys, gate) / self.temperature
+            # fp16 squares gates below 2.4e-4 to 0, and its clamp_min(1e-12) is 0 too: 0 * inf = NaN.
+            with torch.autocast('cuda', enabled=False):
+                raw = self.gate(feat.float()).sigmoid()
+                # raw * 0 keeps the gate parameters in the DDP graph when the ablation is on.
+                gate = raw if not self.force_ones else raw * 0 + 1
+                with torch.no_grad():
+                    g = gate.detach()
+                    self.gate_stats = {
+                        'mean': float(g.mean()),
+                        'std': float(g.std(unbiased=False)),
+                        'lo': float((g < 0.05).float().mean()),
+                        'hi': float((g > 0.95).float().mean()),
+                    }
+                logits = fused_gated_contrast(z_s.float(), keys.float(), gate) / self.temperature
             if label:
                 term = F.cross_entropy(logits[has], t_idx[has]) if has.any() else logits.sum() * 0
             else:
@@ -946,6 +950,10 @@ class Hydra(nn.Module):
         mon0 = dict(self.monitor)
         loss1 = self._direction(q1, k0, guide)
         self.monitor = {key: (mon0[key] + self.monitor[key]) / 2 for key in mon0}
+        # Backbone collapse shows here first; zs_std sits behind a norm layer and can hide it.
+        with torch.no_grad():
+            u = F.normalize(h_t.detach().float(), dim=-1)
+            self.monitor['cls_cos'] = float((u @ u.T).mean())
         return (loss0 + loss1) / 2
 
 
@@ -1022,6 +1030,9 @@ def _check_hydra():
     same = hydra(z, z, t_p)
     same.backward()
     assert math.isfinite(float(same.detach()))
+    with torch.no_grad():
+        shifted = hydra.projector(h_t.detach() + 1e4 * torch.randn(1, d))
+        assert float(shifted.std(0).mean()) > 0.5, "a batch-constant [CLS] must not collapse the keys"
     print('hydra ok', float(loss.detach()))
 
 
