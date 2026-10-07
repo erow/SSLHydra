@@ -940,7 +940,16 @@ class Hydra(nn.Module):
             self.monitor = _label_monitor(z_s, keys, gathered, rows, logits, has)
         else:
             self.monitor = _hydra_monitor(z_s, keys, gathered, rows, logits, self.tau)
-        return total / self.k
+        pair = total / self.k
+        # Ungated MoCo term (SimLAP lam=1). A [CLS] shared by the batch cannot hide from it.
+        if self.strategy in ('sim', 'rand'):
+            with torch.autocast('cuda', enabled=False):
+                q = F.normalize(z_s.float(), dim=-1)
+                k = F.normalize(keys.float(), dim=-1)
+                inst = F.cross_entropy(q @ k.T / self.temperature, rows)
+            self.monitor['ins'] = float(inst.detach())
+            pair = pair + inst
+        return pair
 
     def forward(self, h_s, h_t, guide):
         # Both views share one norm. Chunk only after that.
@@ -1003,7 +1012,10 @@ def _check_hydra():
         t_idx = sample_partner(t_p, 'rand', 0.1)
         gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
         logits = fused_gated_contrast(q, k, gate) / 0.2
-        return F.cross_entropy(logits.masked_fill(torch.eye(b, dtype=torch.bool), float('-inf')), t_idx)
+        pair = F.cross_entropy(logits.masked_fill(torch.eye(b, dtype=torch.bool), float('-inf')), t_idx)
+        qn = F.normalize(q.float(), dim=-1)
+        kn = F.normalize(k.float(), dim=-1)
+        return pair + F.cross_entropy(qn @ kn.T / 0.2, own)
 
     ref = (one(q0, k1) + one(q1, k0)) / 2
     assert torch.allclose(loss, ref), (float(loss), float(ref))
