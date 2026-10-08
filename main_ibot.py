@@ -378,6 +378,8 @@ def train_ibot(args):
             )
             wandb.define_metric('epoch')
             wandb.define_metric('train/*', step_metric='epoch')
+            wandb.define_metric('global_step')
+            wandb.define_metric('train_step/*', step_metric='global_step')
         
     # ============ Hydra gate + frozen teacher table ... ============
     use_hydra = args.loss in ('hydra', 'both')
@@ -502,6 +504,28 @@ def train_ibot(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
+def _wandb_log_step(metrics, global_step, epoch_progress, args):
+    """Average scalar step metrics across ranks and log one W&B record."""
+    if args.no_wandb:
+        return
+    keys = sorted(metrics)
+    values = torch.tensor(
+        [float(metrics[key]) for key in keys],
+        dtype=torch.float64,
+        device='cuda',
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(values)
+        values /= dist.get_world_size()
+    if utils.is_main_process():
+        import wandb
+        wandb.log({
+            **{f'train_step/{key}': value for key, value in zip(keys, values.cpu().tolist())},
+            'global_step': global_step,
+            'epoch_progress': epoch_progress,
+        })
+
+
 
 def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
@@ -549,9 +573,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
                 student_backbone, student_output = student(
                     crops, mask=crop_masks, return_backbone_feat=True)
             elif args.loss == 'hydra':
-                teacher_backbone = teacher(crops)
-                student_backbone = student(crops, mask=crop_masks)
-                teacher_output = student_output = None
+                teacher_backbone, teacher_output = teacher(crops, return_backbone_feat=True)
+                student_backbone, student_output = student(
+                    crops, mask=crop_masks, return_backbone_feat=True)
             else:
                 teacher_output = teacher(crops)
                 student_output = student(crops, mask=crop_masks)
@@ -646,6 +670,21 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         metric_logger.update(gnorm=gnorm)
         if hydra is not None:
             metric_logger.update(**hydra.module.monitor)
+        if (local_it + 1) % 10 == 0:
+            step_metrics = {
+                'loss': loss.item(),
+                **{key: value.item() for key, value in all_loss.items()},
+                'lr': optimizer.param_groups[0]['lr'],
+                'wd': optimizer.param_groups[0]['weight_decay'],
+                'acc': acc,
+                'gnorm': gnorm,
+            }
+            if hydra is not None:
+                step_metrics.update(hydra.module.monitor)
+            _wandb_log_step(
+                step_metrics, it + 1,
+                epoch + (local_it + 1) / len(data_loader), args,
+            )
         if args.max_steps and local_it + 1 >= args.max_steps:
             break
 
