@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import copy
 import os
 import shutil
 import sys
@@ -30,7 +31,6 @@ from models.head import iBOTHead
 from loader import IBotFFCVLoader, ImageFolderMask
 from evaluation.unsupervised.unsup_cls import eval_pred
 from fused_gated_contrast import fused_gated_contrast
-from simlap import gather_with_grad
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -170,8 +170,10 @@ def get_args_parser():
         help='Number of partner draws / subspaces averaged into loss_hydra.')
     parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand', 'self', 'label'],
         help='Partner index: teacher similarity, uniform, the same sample, or another image of the same class.')
-    parser.add_argument('--hydra_mlp_dim', default=1024, type=int,
+    parser.add_argument('--hydra_mlp_dim', default=4096, type=int,
         help='Hidden width of the gate MLP.')
+    parser.add_argument('--hydra_out_dim', default=2048, type=int,
+        help='Projector, predictor, key, and gate width. 0 uses the backbone embed_dim.')
     parser.add_argument('--hydra_weight', default=1.0, type=float,
         help='Multiplier on loss_hydra when --loss is hydra or both.')
     parser.add_argument('--init_ibot', default='', type=str,
@@ -394,6 +396,7 @@ def train_ibot(args):
             args.hydra_tau,
             args.hydra_k,
             args.hydra_pair,
+            out_dim=args.hydra_out_dim or embed_dim,
         ).cuda()
         if utils.has_batchnorms(hydra):
             hydra = nn.SyncBatchNorm.convert_sync_batchnorm(hydra)
@@ -630,6 +633,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             m = momentum_schedule[it]  # momentum parameter
             for param_q, param_k in zip(params_q, params_k):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+            if hydra is not None:
+                hydra.module.update_teacher(m)
 
         # logging
         torch.cuda.synchronize()
@@ -862,21 +867,28 @@ def _cls_token(tokens):
 class Hydra(nn.Module):
     """Own projector and predictor on backbone [CLS], then gated InfoNCE."""
 
-    def __init__(self, teacher_dim, embed_dim, mlp_dim, temperature, tau, k, strategy):
+    def __init__(self, teacher_dim, embed_dim, mlp_dim, temperature, tau, k, strategy,
+                 out_dim=None):
         super().__init__()
 
-        def mlp(last):
+        out_dim = embed_dim if out_dim is None else out_dim
+        if out_dim <= 0:
+            raise ValueError(f"Hydra out_dim must be positive, got {out_dim}")
+
+        def mlp(in_dim):
             return nn.Sequential(
-                nn.Linear(embed_dim, mlp_dim),
+                nn.Linear(in_dim, mlp_dim),
                 nn.GELU(),
-                nn.Linear(mlp_dim, embed_dim),
-                last,
+                nn.Linear(mlp_dim, out_dim),
+                nn.LayerNorm(out_dim),
             )
 
-        # BN on the shared projector centres keys and queries alike (SimLAP bn-ln). With BN only on
-        # the query side, a batch-constant [CLS] is free for the student and collapses the keys.
-        self.projector = mlp(nn.BatchNorm1d(embed_dim, affine=False))
-        self.predictor = mlp(nn.LayerNorm(embed_dim))
+        # Query uses LN only. The matching EMA projector is followed by key-only BN.
+        # Key BN uses batch statistics during training, even with gradients disabled.
+        self.projector = mlp(embed_dim)
+        self.teacher_projector = copy.deepcopy(self.projector).requires_grad_(False)
+        self.key_bn = nn.BatchNorm1d(out_dim, affine=False)
+        self.predictor = mlp(out_dim)
         # ImageNet class ids replace the 8192-d teacher row. The gate reads that embedding.
         self.label_embed = nn.Embedding(1000, mlp_dim) if strategy == 'label' else None
         gate_in = mlp_dim if strategy == 'label' else teacher_dim
@@ -884,8 +896,9 @@ class Hydra(nn.Module):
             nn.Linear(gate_in, mlp_dim),
             nn.BatchNorm1d(mlp_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(mlp_dim, embed_dim),
+            nn.Linear(mlp_dim, out_dim),
         )
+        self.out_dim = out_dim
         self.temperature = temperature
         self.tau = tau
         self.k = k
@@ -894,10 +907,24 @@ class Hydra(nn.Module):
         self.force_ones = False
         self.monitor = {}
 
+    @torch.no_grad()
+    def update_teacher(self, momentum):
+        """EMA parameters only; key BN keeps its own batch-derived buffers."""
+        for online, target in zip(self.projector.parameters(), self.teacher_projector.parameters()):
+            target.mul_(momentum).add_(online, alpha=1 - momentum)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Old shared-projector checkpoints have a different normalization contract.
+        # Refuse partial restoration, which would silently leave random EMA weights.
+        if not any(key.startswith(prefix + 'teacher_projector.') for key in state_dict):
+            raise RuntimeError("Hydra checkpoint lacks the EMA teacher projector; "
+                               "start this architecture from scratch.")
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def _direction(self, z_s, z_t, guide):
         """One view as the query, the other view as the keys."""
         b = z_s.shape[0]
-        keys = gather_with_grad(z_t)
+        keys = _all_gather(z_t.detach())
         label = self.strategy == 'label'
         gathered = _all_gather(guide.long().view(-1) if label else guide)
         offset = utils.get_rank() * b
@@ -940,21 +967,13 @@ class Hydra(nn.Module):
             self.monitor = _label_monitor(z_s, keys, gathered, rows, logits, has)
         else:
             self.monitor = _hydra_monitor(z_s, keys, gathered, rows, logits, self.tau)
-        pair = total / self.k
-        # Ungated MoCo term (SimLAP lam=1). A [CLS] shared by the batch cannot hide from it.
-        if self.strategy in ('sim', 'rand'):
-            with torch.autocast('cuda', enabled=False):
-                q = F.normalize(z_s.float(), dim=-1)
-                k = F.normalize(keys.float(), dim=-1)
-                inst = F.cross_entropy(q @ k.T / self.temperature, rows)
-            self.monitor['ins'] = float(inst.detach())
-            pair = pair + inst
-        return pair
+        return total / self.k
 
     def forward(self, h_s, h_t, guide):
         # Both views share one norm. Chunk only after that.
         z_s = self.predictor(self.projector(h_s))
-        z_t = self.projector(h_t)
+        with torch.no_grad():
+            z_t = self.key_bn(self.teacher_projector(h_t))
         guide = guide.detach()
         q0, q1 = z_s.chunk(2, dim=0)
         k0, k1 = z_t.chunk(2, dim=0)
@@ -1004,7 +1023,7 @@ def _check_hydra():
     loss = hydra(h_s, h_t, t_p)
     torch.manual_seed(1)
     z_s = hydra.predictor(hydra.projector(h_s))
-    z_t = hydra.projector(h_t)
+    z_t = hydra.key_bn(hydra.teacher_projector(h_t.detach()))
     q0, q1 = z_s.chunk(2, dim=0)
     k0, k1 = z_t.chunk(2, dim=0)
 
@@ -1013,15 +1032,14 @@ def _check_hydra():
         gate = hydra.gate((t_p + t_p[t_idx]) * 0.5).sigmoid()
         logits = fused_gated_contrast(q, k, gate) / 0.2
         pair = F.cross_entropy(logits.masked_fill(torch.eye(b, dtype=torch.bool), float('-inf')), t_idx)
-        qn = F.normalize(q.float(), dim=-1)
-        kn = F.normalize(k.float(), dim=-1)
-        return pair + F.cross_entropy(qn @ kn.T / 0.2, own)
+        return pair
 
     ref = (one(q0, k1) + one(q1, k0)) / 2
     assert torch.allclose(loss, ref), (float(loss), float(ref))
     loss.backward()
     assert h_s.grad is not None and float(h_s.grad.abs().sum()) > 0
-    assert h_t.grad is not None and float(h_t.grad.abs().sum()) > 0
+    assert h_t.grad is None
+    assert all(not p.requires_grad and p.grad is None for p in hydra.teacher_projector.parameters())
     assert hydra.projector[0].weight.grad is not None
     assert hydra.predictor[0].weight.grad is not None
     assert hydra.gate[0].weight.grad is not None
@@ -1032,7 +1050,7 @@ def _check_hydra():
     ht = torch.randn(2 * b, d)
     loss_self = hydra_self(hs, ht, t_p)
     zs = hydra_self.predictor(hydra_self.projector(hs))
-    zt = hydra_self.projector(ht)
+    zt = hydra_self.key_bn(hydra_self.teacher_projector(ht))
     s0, s1 = zs.chunk(2, dim=0)
     t0, t1 = zt.chunk(2, dim=0)
     # Partner is this sample, so the gate sees t_p averaged with itself.
@@ -1047,8 +1065,8 @@ def _check_hydra():
     same.backward()
     assert math.isfinite(float(same.detach()))
     with torch.no_grad():
-        shifted = hydra.projector(h_t.detach() + 1e4 * torch.randn(1, d))
-        assert float(shifted.std(0).mean()) > 0.5, "a batch-constant [CLS] must not collapse the keys"
+        shifted = hydra.key_bn(hydra.teacher_projector(h_t.detach()))
+        assert float(shifted.std(0).mean()) > 0.5, "key BN should normalize a nonconstant batch"
     print('hydra ok', float(loss.detach()))
 
 
