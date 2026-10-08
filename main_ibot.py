@@ -26,7 +26,6 @@ from pathlib import Path
 from PIL import Image
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
-from torch.utils.tensorboard import SummaryWriter
 from models.head import iBOTHead
 from loader import IBotFFCVLoader, ImageFolderMask
 from evaluation.unsupervised.unsup_cls import eval_pred
@@ -168,6 +167,8 @@ def get_args_parser():
         help='InfoNCE temperature. Distinct from --hydra_tau.')
     parser.add_argument('--hydra_k', default=1, type=int,
         help='Number of partner draws / subspaces averaged into loss_hydra.')
+    parser.add_argument('--hydra_filter_negatives', default=True, type=utils.bool_flag,
+        help='Remove denominator keys whose teacher similarity to the anchor exceeds the sampled pair.')
     parser.add_argument('--hydra_pair', default='sim', choices=['sim', 'rand', 'self', 'label'],
         help='Partner index: teacher similarity, uniform, the same sample, or another image of the same class.')
     parser.add_argument('--hydra_mlp_dim', default=4096, type=int,
@@ -353,9 +354,7 @@ def train_ibot(args):
         mim_start_epoch=args.pred_start_epoch,
     ).cuda()
 
-    if utils.is_main_process(): # Tensorboard configuration
-        local_runs = os.path.join(args.output_dir, 'tf_logs')
-        writer = SummaryWriter(log_dir=local_runs)
+    if utils.is_main_process():
         if not args.no_wandb:
             import subprocess
             import wandb
@@ -375,9 +374,10 @@ def train_ibot(args):
                 name=os.environ.get("WANDB_NAME") or os.environ.get("SLURM_JOB_NAME") or Path(args.output_dir).name,
                 dir=args.output_dir,
                 config=vars(args),
-                sync_tensorboard=True,
                 settings=settings,
             )
+            wandb.define_metric('epoch')
+            wandb.define_metric('train/*', step_metric='epoch')
         
     # ============ Hydra gate + frozen teacher table ... ============
     use_hydra = args.loss in ('hydra', 'both')
@@ -397,6 +397,7 @@ def train_ibot(args):
             args.hydra_k,
             args.hydra_pair,
             out_dim=args.hydra_out_dim or embed_dim,
+            filter_negatives=args.hydra_filter_negatives,
         ).cuda()
         if utils.has_batchnorms(hydra):
             hydra = nn.SyncBatchNorm.convert_sync_batchnorm(hydra)
@@ -484,17 +485,15 @@ def train_ibot(args):
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
-        if args.saveckp_freq and (epoch % args.saveckp_freq == 0) and epoch:
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
+        if args.saveckp_freq and (epoch + 1) % args.saveckp_freq == 0:
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch + 1:04}.pth'))
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-                for k, v in train_stats.items():
-                    writer.add_scalar(k, v, epoch)
-                if not args.no_wandb:
-                    wandb.log(train_stats, step=epoch)
+            if not args.no_wandb:
+                wandb.log({**{f'train/{k}': v for k, v in train_stats.items()}, 'epoch': epoch})
 
     if utils.is_main_process() and not args.no_wandb:
         wandb.finish()
@@ -827,10 +826,9 @@ def _hydra_monitor(z_s, keys, t_all, rows, logits, tau_s):
         sample_sim = ref @ ref.T
         # y indexes this rank's queries into the gathered reference.
         graph = sample_sim[rows[:, None], torch.arange(sample_sim.shape[1], device=sample_sim.device)]
-        self_mask = torch.zeros_like(graph, dtype=torch.bool)
-        self_mask[torch.arange(graph.shape[0], device=graph.device), rows] = True
-        graph = (graph / tau_s).masked_fill(self_mask, float('-inf'))
-        log_p = logits.detach().float().log_softmax(dim=1).masked_fill(self_mask, 0)
+        excluded = ~torch.isfinite(logits)
+        graph = (graph / tau_s).masked_fill(excluded, float('-inf'))
+        log_p = logits.detach().float().log_softmax(dim=1).masked_fill(excluded, 0)
         p_ref = graph.softmax(dim=1)
         ref_h = -(p_ref * log_p).sum(dim=1).mean()
         ref_ent = -(p_ref * p_ref.clamp_min(1e-12).log()).sum(dim=1).mean()
@@ -868,7 +866,7 @@ class Hydra(nn.Module):
     """Own projector and predictor on backbone [CLS], then gated InfoNCE."""
 
     def __init__(self, teacher_dim, embed_dim, mlp_dim, temperature, tau, k, strategy,
-                 out_dim=None):
+                 out_dim=None, filter_negatives=False):
         super().__init__()
 
         out_dim = embed_dim if out_dim is None else out_dim
@@ -902,6 +900,7 @@ class Hydra(nn.Module):
         self.temperature = temperature
         self.tau = tau
         self.k = k
+        self.filter_negatives = filter_negatives
         self.strategy = strategy
         # Experiment switch: a constant gate ignores t_p when choosing the subspace.
         self.force_ones = False
@@ -929,14 +928,25 @@ class Hydra(nn.Module):
         gathered = _all_gather(guide.long().view(-1) if label else guide)
         offset = utils.get_rank() * b
         rows = torch.arange(b, device=z_s.device) + offset
+        guide_sim = None
+        if not label and (self.filter_negatives or self.strategy == 'sim') and self.strategy != 'self':
+            with torch.no_grad():
+                ref = F.normalize(gathered.float(), dim=-1)
+                guide_sim = ref[rows] @ ref.T
         total = 0
         has = None
+        filtered_records = []
+        gate_records = []
         for _ in range(self.k):
             with torch.no_grad():
                 if label:
                     t_idx, has = _label_partner(gathered, rows)
                 else:
-                    t_idx = _sample_rows(gathered, rows, self.strategy, self.tau)
+                    if self.strategy == 'sim':
+                        sample_logits = guide_sim.masked_fill(F.one_hot(rows, guide_sim.shape[1]).bool(), float('-inf'))
+                        t_idx = torch.multinomial(torch.softmax(sample_logits / self.tau, dim=-1), 1).squeeze(1)
+                    else:
+                        t_idx = _sample_rows(gathered, rows, self.strategy, self.tau)
             if label:
                 feat = self.label_embed(gathered[rows])
             else:
@@ -950,23 +960,47 @@ class Hydra(nn.Module):
                     g = gate.detach()
                     self.gate_stats = {
                         'mean': float(g.mean()),
+                        'act': float(g.sum(1).mean()),
                         'std': float(g.std(unbiased=False)),
                         'lo': float((g < 0.05).float().mean()),
                         'hi': float((g > 0.95).float().mean()),
                     }
+                    gate_records.append(self.gate_stats)
                 logits = fused_gated_contrast(z_s.float(), keys.float(), gate) / self.temperature
             if label:
                 term = F.cross_entropy(logits[has], t_idx[has]) if has.any() else logits.sum() * 0
             else:
+                excluded = torch.zeros_like(logits, dtype=torch.bool)
                 if self.strategy != 'self':
                     # The query's other view is not a negative; SimLAP keeps the anchor out of the denominator.
-                    logits = logits.masked_fill(F.one_hot(rows, logits.shape[1]).bool(), float('-inf'))
+                    excluded.scatter_(1, rows[:, None], True)
+                if self.filter_negatives and guide_sim is not None:
+                    pair_sim = guide_sim.gather(1, t_idx[:, None])
+                    # A key more similar than the sampled pair is an ambiguous false negative.
+                    excluded |= guide_sim > pair_sim
+                    excluded.scatter_(1, t_idx[:, None], False)
+                    candidates = max(logits.shape[1] - 2, 1)
+                    filtered = (excluded.sum(1) - 1).clamp_min(0).float() / candidates
+                    filtered_records.append(float(filtered.mean()))
+                logits = logits.masked_fill(excluded, float('-inf'))
                 term = F.cross_entropy(logits, t_idx)
             total = total + term
+        self.gate_stats = {
+            key: sum(record[key] for record in gate_records) / len(gate_records)
+            for key in gate_records[0]
+        }
         if label:
             self.monitor = _label_monitor(z_s, keys, gathered, rows, logits, has)
         else:
             self.monitor = _hydra_monitor(z_s, keys, gathered, rows, logits, self.tau)
+        self.monitor.update({
+            'act': self.gate_stats['act'],
+            'gate_mean': self.gate_stats['mean'],
+            'gate_std': self.gate_stats['std'],
+            'gate_lo': self.gate_stats['lo'],
+            'gate_hi': self.gate_stats['hi'],
+            'neg_filtered': (sum(filtered_records) / len(filtered_records) if filtered_records else 0.0),
+        })
         return total / self.k
 
     def forward(self, h_s, h_t, guide):

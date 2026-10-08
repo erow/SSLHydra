@@ -71,6 +71,20 @@ class TeacherTests(unittest.TestCase):
             torch.testing.assert_close(p, value)
         torch.testing.assert_close(m.key_bn.running_mean, bn_before)
 
+    def test_teacher_similarity_filter_and_gate_metrics(self):
+        m = Hydra(6, 8, 16, .2, .1, 4, 'sim', out_dim=12, filter_negatives=True)
+        student = torch.randn(16, 8, requires_grad=True)
+        teacher = torch.randn(16, 8)
+        guide = torch.randn(8, 6)
+        loss = m(student, teacher, guide)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreaterEqual(m.monitor['neg_filtered'], 0)
+        self.assertLessEqual(m.monitor['neg_filtered'], 1)
+        self.assertAlmostEqual(m.monitor['act'], m.monitor['gate_mean'] * 12, places=5)
+        loss.backward()
+        self.assertGreater(student.grad.abs().sum().item(), 0)
+
+
     def test_checkpoint_and_legacy_rejection(self):
         m = self.model
         with torch.no_grad():
