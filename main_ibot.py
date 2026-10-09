@@ -60,7 +60,7 @@ def get_args_parser():
         help="""Whether or not to weight normalize the last layer of the head.
         Not normalizing leads to better performance but can make the training unstable.
         In our experiments, we typically set this paramater to False with vit_small and True with vit_base.""")
-    parser.add_argument('--momentum_teacher', default=0.996, type=float, help="""Base EMA
+    parser.add_argument('--momentum_teacher', default=0.9995, type=float, help="""Base EMA
         parameter for teacher update. The value is increased to 1 during training with cosine schedule.
         We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
     parser.add_argument('--norm_in_head', default=None,
@@ -179,6 +179,8 @@ def get_args_parser():
         help='Multiplier on loss_hydra when --loss is hydra or both.')
     parser.add_argument('--hydra_lr_scale', default=1.0, type=float,
         help='Hydra learning-rate multiplier relative to the backbone learning rate.')
+    parser.add_argument('--hydra_force_ones', default=False, type=utils.bool_flag,
+        help='Use an all-ones gate while retaining gate parameters in the DDP graph.')
     parser.add_argument('--init_ibot', default='', type=str,
         help='iBOT checkpoint. Copy its teacher weights into the student and teacher. Epoch stays 0.')
     parser.add_argument('--init_hydra', default='', type=str,
@@ -446,6 +448,7 @@ def train_ibot(args):
         if utils.has_batchnorms(hydra):
             hydra = nn.SyncBatchNorm.convert_sync_batchnorm(hydra)
         hydra = nn.parallel.DistributedDataParallel(hydra, device_ids=[args.gpu])
+        hydra.module.force_ones = args.hydra_force_ones
     else:
         teacher_table = None
         hydra = None
