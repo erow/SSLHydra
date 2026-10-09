@@ -177,8 +177,12 @@ def get_args_parser():
         help='Projector, predictor, key, and gate width. 0 uses the backbone embed_dim.')
     parser.add_argument('--hydra_weight', default=1.0, type=float,
         help='Multiplier on loss_hydra when --loss is hydra or both.')
+    parser.add_argument('--hydra_lr_scale', default=1.0, type=float,
+        help='Hydra learning-rate multiplier relative to the backbone learning rate.')
     parser.add_argument('--init_ibot', default='', type=str,
         help='iBOT checkpoint. Copy its teacher weights into the student and teacher. Epoch stays 0.')
+    parser.add_argument('--init_hydra', default='', type=str,
+        help='Checkpoint whose Hydra state is loaded without restoring backbone, optimizer, or epoch.')
     parser.add_argument('--freeze_backbone', default=False, type=utils.bool_flag,
         help='Freeze the initialized student/teacher backbones and optimize only Hydra.')
     return parser
@@ -203,6 +207,20 @@ def _init_from_ibot(student, teacher, path):
         f'student_missing={len(inc_s.missing_keys)} teacher_missing=0',
         flush=True,
     )
+
+
+def _init_hydra(hydra, path):
+    """Load only Hydra weights and buffers; leave the backbone and optimizer fresh."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    try:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location='cpu')
+    if not isinstance(ckpt, dict) or 'hydra' not in ckpt:
+        raise RuntimeError(f'Hydra state not found in {path}')
+    hydra.load_state_dict(ckpt['hydra'], strict=True)
+    print(f'loaded Hydra state from {path}', flush=True)
 
 
 class _FrozenStudentWrapper(nn.Module):
@@ -435,7 +453,8 @@ def train_ibot(args):
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
     if hydra is not None:
-        params_groups = _merge_param_groups(params_groups, utils.get_params_groups(hydra))
+        params_groups = _merge_param_groups(
+            params_groups, utils.get_params_groups(hydra), args.hydra_lr_scale)
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
     elif args.optimizer == "sgd":
@@ -469,6 +488,10 @@ def train_ibot(args):
     to_restore = {"epoch": 0}
     if args.init_ibot:
         _init_from_ibot(student, teacher_without_ddp, args.init_ibot)
+    if args.init_hydra:
+        if hydra is None:
+            raise ValueError('--init_hydra requires --loss hydra or --loss both')
+        _init_hydra(hydra, args.init_hydra)
     if args.freeze_backbone:
         if not args.init_ibot:
             raise ValueError('--freeze_backbone requires --init_ibot')
@@ -585,9 +608,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             idx = None
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + local_it  # global training iteration
-        for i, param_group in enumerate(optimizer.param_groups):
-            param_group["lr"] = lr_schedule[it]
-            if i == 0:  # only the first group is regularized
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr_schedule[it] * param_group.get("lr_scale", 1.0)
+            if param_group["weight_decay"] > 0:
                 param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
@@ -696,6 +719,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         for key, value in all_loss.items():
             metric_logger.update(**{key: value.item()})
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        if hydra is not None:
+            metric_logger.update(hydra_lr=lr_schedule[it] * args.hydra_lr_scale)
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
         metric_logger.update(acc=acc)
         metric_logger.update(gnorm=gnorm)
@@ -706,6 +731,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
                 'loss': loss.item(),
                 **{key: value.item() for key, value in all_loss.items()},
                 'lr': optimizer.param_groups[0]['lr'],
+                'hydra_lr': lr_schedule[it] * args.hydra_lr_scale,
                 'wd': optimizer.param_groups[0]['weight_decay'],
                 'acc': acc,
                 'gnorm': gnorm,
@@ -731,8 +757,18 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     return return_dict
 
 
-def _merge_param_groups(student_groups, hydra_groups):
+def _merge_param_groups(student_groups, hydra_groups, hydra_lr_scale=1.0):
     """Keep the iBOT split: group 0 follows the weight-decay schedule."""
+    if hydra_lr_scale <= 0:
+        raise ValueError(f'--hydra_lr_scale must be positive, got {hydra_lr_scale}')
+    if hydra_lr_scale != 1.0:
+        return [
+            {'params': student_groups[0]['params']},
+            {'params': student_groups[1]['params'], 'weight_decay': 0.},
+            {'params': hydra_groups[0]['params'], 'lr_scale': hydra_lr_scale},
+            {'params': hydra_groups[1]['params'], 'weight_decay': 0.,
+             'lr_scale': hydra_lr_scale},
+        ]
     return [
         {'params': student_groups[0]['params'] + hydra_groups[0]['params']},
         {'params': student_groups[1]['params'] + hydra_groups[1]['params'], 'weight_decay': 0.},
@@ -1089,6 +1125,8 @@ class Hydra(nn.Module):
         with torch.no_grad():
             u = F.normalize(h_t.detach().float(), dim=-1)
             self.monitor['cls_cos'] = float((u @ u.T).mean())
+            u0, u1 = u.chunk(2, dim=0)
+            self.monitor['cls_pair_cos'] = float((u0 * u1).sum(dim=-1).mean())
         return (loss0 + loss1) / 2
 
 
