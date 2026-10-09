@@ -63,6 +63,7 @@ def main():
         '--arch', 'vit_base',
         '--epochs', '10',
         '--warmup_epochs', '1',
+        '--warmup_teacher_temp_epochs', '1',
         '--loss', 'hydra',
         '--hydra_pair', 'sim',
         '--hydra_k', str(cfg['hydra_k']),
