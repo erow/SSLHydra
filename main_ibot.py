@@ -179,6 +179,8 @@ def get_args_parser():
         help='Multiplier on loss_hydra when --loss is hydra or both.')
     parser.add_argument('--init_ibot', default='', type=str,
         help='iBOT checkpoint. Copy its teacher weights into the student and teacher. Epoch stays 0.')
+    parser.add_argument('--freeze_backbone', default=False, type=utils.bool_flag,
+        help='Freeze the initialized student/teacher backbones and optimize only Hydra.')
     return parser
 
 
@@ -201,6 +203,17 @@ def _init_from_ibot(student, teacher, path):
         f'student_missing={len(inc_s.missing_keys)} teacher_missing=0',
         flush=True,
     )
+
+
+class _FrozenStudentWrapper(nn.Module):
+    """Preserve ``student.module`` and checkpoint keys without using DDP."""
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
 def train_ibot(args):
     # Numba records builtins.print at import. init_distributed_mode replaces
@@ -311,6 +324,13 @@ def train_ibot(args):
         teacher_head = _ibot_head(args.shared_head_teacher)
     student = utils.MultiCropWrapper(student, student_head)
     teacher = utils.MultiCropWrapper(teacher, teacher_head)
+    if args.freeze_backbone:
+        if args.loss != 'hydra':
+            raise ValueError('--freeze_backbone requires --loss hydra')
+        for p in student.backbone.parameters():
+            p.requires_grad = False
+        # Frozen features should not retain stochastic DropPath.
+        student.backbone.eval()
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -326,9 +346,13 @@ def train_ibot(args):
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
     # Hydra uses the [CLS] head only, so the patch-token parameters get no gradient.
-    student = nn.parallel.DistributedDataParallel(
-        student, device_ids=[args.gpu], broadcast_buffers='swin' not in args.arch,
-        find_unused_parameters=(args.loss == 'hydra'))
+    if args.freeze_backbone:
+        # DDP refuses modules without trainable parameters. Hydra remains DDP.
+        student = _FrozenStudentWrapper(student)
+    else:
+        student = nn.parallel.DistributedDataParallel(
+            student, device_ids=[args.gpu], broadcast_buffers='swin' not in args.arch,
+            find_unused_parameters=(args.loss == 'hydra'))
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
     # there is no backpropagation through the teacher, so no need for gradients
@@ -445,6 +469,13 @@ def train_ibot(args):
     to_restore = {"epoch": 0}
     if args.init_ibot:
         _init_from_ibot(student, teacher_without_ddp, args.init_ibot)
+    if args.freeze_backbone:
+        if not args.init_ibot:
+            raise ValueError('--freeze_backbone requires --init_ibot')
+        trainable_student = sum(p.numel() for p in student.parameters() if p.requires_grad)
+        if trainable_student:
+            raise RuntimeError(f'frozen student still has {trainable_student} trainable parameters')
+        print('frozen iBOT backbone; optimizer updates Hydra only', flush=True)
     if args.load_from:
         ckpt_kwargs = dict(
             student=student,
