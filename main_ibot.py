@@ -185,6 +185,9 @@ def get_args_parser():
         help='iBOT checkpoint. Copy its teacher weights into the student and teacher. Epoch stays 0.')
     parser.add_argument('--init_hydra', default='', type=str,
         help='Checkpoint whose Hydra state is loaded without restoring backbone, optimizer, or epoch.')
+    parser.add_argument('--init_hydra_parts', default='all',
+        choices=['all', 'gate', 'projectors'],
+        help='Subset restored by --init_hydra. projectors excludes the gate.')
     parser.add_argument('--freeze_backbone', default=False, type=utils.bool_flag,
         help='Freeze the initialized student/teacher backbones and optimize only Hydra.')
     return parser
@@ -211,8 +214,8 @@ def _init_from_ibot(student, teacher, path):
     )
 
 
-def _init_hydra(hydra, path):
-    """Load only Hydra weights and buffers; leave the backbone and optimizer fresh."""
+def _init_hydra(hydra, path, parts='all'):
+    """Load selected Hydra weights; leave the backbone and optimizer fresh."""
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
     try:
@@ -221,8 +224,24 @@ def _init_hydra(hydra, path):
         ckpt = torch.load(path, map_location='cpu')
     if not isinstance(ckpt, dict) or 'hydra' not in ckpt:
         raise RuntimeError(f'Hydra state not found in {path}')
-    hydra.load_state_dict(ckpt['hydra'], strict=True)
-    print(f'loaded Hydra state from {path}', flush=True)
+    target = hydra.module if hasattr(hydra, 'module') else hydra
+    state = {key.removeprefix('module.'): value for key, value in ckpt['hydra'].items()}
+    if parts == 'gate':
+        state = {key: value for key, value in state.items() if key.startswith('gate.')}
+    elif parts == 'projectors':
+        prefixes = ('projector.', 'teacher_projector.', 'predictor.', 'key_bn.')
+        state = {key: value for key, value in state.items() if key.startswith(prefixes)}
+    elif parts != 'all':
+        raise ValueError(f'unknown Hydra initialization subset: {parts}')
+    if not state:
+        raise RuntimeError(f'no Hydra {parts} tensors found in {path}')
+    incompatible = target.load_state_dict(state, strict=parts == 'all')
+    if incompatible.unexpected_keys:
+        raise RuntimeError('unexpected Hydra keys: ' + ', '.join(incompatible.unexpected_keys[:8]))
+    print(
+        f'loaded Hydra state parts={parts} tensors={len(state)} from {path}',
+        flush=True,
+    )
 
 
 class _FrozenStudentWrapper(nn.Module):
@@ -494,7 +513,7 @@ def train_ibot(args):
     if args.init_hydra:
         if hydra is None:
             raise ValueError('--init_hydra requires --loss hydra or --loss both')
-        _init_hydra(hydra, args.init_hydra)
+        _init_hydra(hydra, args.init_hydra, args.init_hydra_parts)
     if args.freeze_backbone:
         if not args.init_ibot:
             raise ValueError('--freeze_backbone requires --init_ibot')
