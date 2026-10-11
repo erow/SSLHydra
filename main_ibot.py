@@ -60,7 +60,7 @@ def get_args_parser():
         help="""Whether or not to weight normalize the last layer of the head.
         Not normalizing leads to better performance but can make the training unstable.
         In our experiments, we typically set this paramater to False with vit_small and True with vit_base.""")
-    parser.add_argument('--momentum_teacher', default=0.996, type=float, help="""Base EMA
+    parser.add_argument('--momentum_teacher', default=0.9995, type=float, help="""Base EMA
         parameter for teacher update. The value is increased to 1 during training with cosine schedule.
         We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
     parser.add_argument('--norm_in_head', default=None,
@@ -177,8 +177,19 @@ def get_args_parser():
         help='Projector, predictor, key, and gate width. 0 uses the backbone embed_dim.')
     parser.add_argument('--hydra_weight', default=1.0, type=float,
         help='Multiplier on loss_hydra when --loss is hydra or both.')
+    parser.add_argument('--hydra_lr_scale', default=1.0, type=float,
+        help='Hydra learning-rate multiplier relative to the backbone learning rate.')
+    parser.add_argument('--hydra_force_ones', default=False, type=utils.bool_flag,
+        help='Use an all-ones gate while retaining gate parameters in the DDP graph.')
     parser.add_argument('--init_ibot', default='', type=str,
         help='iBOT checkpoint. Copy its teacher weights into the student and teacher. Epoch stays 0.')
+    parser.add_argument('--init_hydra', default='', type=str,
+        help='Checkpoint whose Hydra state is loaded without restoring backbone, optimizer, or epoch.')
+    parser.add_argument('--init_hydra_parts', default='all',
+        choices=['all', 'gate', 'projectors'],
+        help='Subset restored by --init_hydra. projectors excludes the gate.')
+    parser.add_argument('--freeze_backbone', default=False, type=utils.bool_flag,
+        help='Freeze the initialized student/teacher backbones and optimize only Hydra.')
     return parser
 
 
@@ -201,6 +212,47 @@ def _init_from_ibot(student, teacher, path):
         f'student_missing={len(inc_s.missing_keys)} teacher_missing=0',
         flush=True,
     )
+
+
+def _init_hydra(hydra, path, parts='all'):
+    """Load selected Hydra weights; leave the backbone and optimizer fresh."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    try:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location='cpu')
+    if not isinstance(ckpt, dict) or 'hydra' not in ckpt:
+        raise RuntimeError(f'Hydra state not found in {path}')
+    target = hydra.module if hasattr(hydra, 'module') else hydra
+    state = {key.removeprefix('module.'): value for key, value in ckpt['hydra'].items()}
+    if parts == 'gate':
+        state = {key: value for key, value in state.items() if key.startswith('gate.')}
+    elif parts == 'projectors':
+        prefixes = ('projector.', 'teacher_projector.', 'predictor.', 'key_bn.')
+        state = {key: value for key, value in state.items() if key.startswith(prefixes)}
+    elif parts != 'all':
+        raise ValueError(f'unknown Hydra initialization subset: {parts}')
+    if not state:
+        raise RuntimeError(f'no Hydra {parts} tensors found in {path}')
+    incompatible = target.load_state_dict(state, strict=parts == 'all')
+    if incompatible.unexpected_keys:
+        raise RuntimeError('unexpected Hydra keys: ' + ', '.join(incompatible.unexpected_keys[:8]))
+    print(
+        f'loaded Hydra state parts={parts} tensors={len(state)} from {path}',
+        flush=True,
+    )
+
+
+class _FrozenStudentWrapper(nn.Module):
+    """Preserve ``student.module`` and checkpoint keys without using DDP."""
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
 def train_ibot(args):
     # Numba records builtins.print at import. init_distributed_mode replaces
@@ -311,6 +363,13 @@ def train_ibot(args):
         teacher_head = _ibot_head(args.shared_head_teacher)
     student = utils.MultiCropWrapper(student, student_head)
     teacher = utils.MultiCropWrapper(teacher, teacher_head)
+    if args.freeze_backbone:
+        if args.loss != 'hydra':
+            raise ValueError('--freeze_backbone requires --loss hydra')
+        for p in student.backbone.parameters():
+            p.requires_grad = False
+        # Frozen features should not retain stochastic DropPath.
+        student.backbone.eval()
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -326,9 +385,13 @@ def train_ibot(args):
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
     # Hydra uses the [CLS] head only, so the patch-token parameters get no gradient.
-    student = nn.parallel.DistributedDataParallel(
-        student, device_ids=[args.gpu], broadcast_buffers='swin' not in args.arch,
-        find_unused_parameters=(args.loss == 'hydra'))
+    if args.freeze_backbone:
+        # DDP refuses modules without trainable parameters. Hydra remains DDP.
+        student = _FrozenStudentWrapper(student)
+    else:
+        student = nn.parallel.DistributedDataParallel(
+            student, device_ids=[args.gpu], broadcast_buffers='swin' not in args.arch,
+            find_unused_parameters=(args.loss == 'hydra'))
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
     # there is no backpropagation through the teacher, so no need for gradients
@@ -378,6 +441,8 @@ def train_ibot(args):
             )
             wandb.define_metric('epoch')
             wandb.define_metric('train/*', step_metric='epoch')
+            wandb.define_metric('global_step')
+            wandb.define_metric('train_step/*', step_metric='global_step')
         
     # ============ Hydra gate + frozen teacher table ... ============
     use_hydra = args.loss in ('hydra', 'both')
@@ -402,6 +467,7 @@ def train_ibot(args):
         if utils.has_batchnorms(hydra):
             hydra = nn.SyncBatchNorm.convert_sync_batchnorm(hydra)
         hydra = nn.parallel.DistributedDataParallel(hydra, device_ids=[args.gpu])
+        hydra.module.force_ones = args.hydra_force_ones
     else:
         teacher_table = None
         hydra = None
@@ -409,7 +475,8 @@ def train_ibot(args):
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
     if hydra is not None:
-        params_groups = _merge_param_groups(params_groups, utils.get_params_groups(hydra))
+        params_groups = _merge_param_groups(
+            params_groups, utils.get_params_groups(hydra), args.hydra_lr_scale)
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
     elif args.optimizer == "sgd":
@@ -443,6 +510,17 @@ def train_ibot(args):
     to_restore = {"epoch": 0}
     if args.init_ibot:
         _init_from_ibot(student, teacher_without_ddp, args.init_ibot)
+    if args.init_hydra:
+        if hydra is None:
+            raise ValueError('--init_hydra requires --loss hydra or --loss both')
+        _init_hydra(hydra, args.init_hydra, args.init_hydra_parts)
+    if args.freeze_backbone:
+        if not args.init_ibot:
+            raise ValueError('--freeze_backbone requires --init_ibot')
+        trainable_student = sum(p.numel() for p in student.parameters() if p.requires_grad)
+        if trainable_student:
+            raise RuntimeError(f'frozen student still has {trainable_student} trainable parameters')
+        print('frozen iBOT backbone; optimizer updates Hydra only', flush=True)
     if args.load_from:
         ckpt_kwargs = dict(
             student=student,
@@ -502,6 +580,28 @@ def train_ibot(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
+def _wandb_log_step(metrics, global_step, epoch_progress, args):
+    """Average scalar step metrics across ranks and log one W&B record."""
+    if args.no_wandb:
+        return
+    keys = sorted(metrics)
+    values = torch.tensor(
+        [float(metrics[key]) for key in keys],
+        dtype=torch.float64,
+        device='cuda',
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(values)
+        values /= dist.get_world_size()
+    if utils.is_main_process():
+        import wandb
+        wandb.log({
+            **{f'train_step/{key}': value for key, value in zip(keys, values.cpu().tolist())},
+            'global_step': global_step,
+            'epoch_progress': epoch_progress,
+        })
+
+
 
 def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
@@ -530,9 +630,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             idx = None
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + local_it  # global training iteration
-        for i, param_group in enumerate(optimizer.param_groups):
-            param_group["lr"] = lr_schedule[it]
-            if i == 0:  # only the first group is regularized
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr_schedule[it] * param_group.get("lr_scale", 1.0)
+            if param_group["weight_decay"] > 0:
                 param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
@@ -549,9 +649,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
                 student_backbone, student_output = student(
                     crops, mask=crop_masks, return_backbone_feat=True)
             elif args.loss == 'hydra':
-                teacher_backbone = teacher(crops)
-                student_backbone = student(crops, mask=crop_masks)
-                teacher_output = student_output = None
+                teacher_backbone, teacher_output = teacher(crops, return_backbone_feat=True)
+                student_backbone, student_output = student(
+                    crops, mask=crop_masks, return_backbone_feat=True)
             else:
                 teacher_output = teacher(crops)
                 student_output = student(crops, mask=crop_masks)
@@ -641,11 +741,29 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         for key, value in all_loss.items():
             metric_logger.update(**{key: value.item()})
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        if hydra is not None:
+            metric_logger.update(hydra_lr=lr_schedule[it] * args.hydra_lr_scale)
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
         metric_logger.update(acc=acc)
         metric_logger.update(gnorm=gnorm)
         if hydra is not None:
             metric_logger.update(**hydra.module.monitor)
+        if (local_it + 1) % 10 == 0:
+            step_metrics = {
+                'loss': loss.item(),
+                **{key: value.item() for key, value in all_loss.items()},
+                'lr': optimizer.param_groups[0]['lr'],
+                'hydra_lr': lr_schedule[it] * args.hydra_lr_scale,
+                'wd': optimizer.param_groups[0]['weight_decay'],
+                'acc': acc,
+                'gnorm': gnorm,
+            }
+            if hydra is not None:
+                step_metrics.update(hydra.module.monitor)
+            _wandb_log_step(
+                step_metrics, it + 1,
+                epoch + (local_it + 1) / len(data_loader), args,
+            )
         if args.max_steps and local_it + 1 >= args.max_steps:
             break
 
@@ -661,8 +779,18 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     return return_dict
 
 
-def _merge_param_groups(student_groups, hydra_groups):
+def _merge_param_groups(student_groups, hydra_groups, hydra_lr_scale=1.0):
     """Keep the iBOT split: group 0 follows the weight-decay schedule."""
+    if hydra_lr_scale <= 0:
+        raise ValueError(f'--hydra_lr_scale must be positive, got {hydra_lr_scale}')
+    if hydra_lr_scale != 1.0:
+        return [
+            {'params': student_groups[0]['params']},
+            {'params': student_groups[1]['params'], 'weight_decay': 0.},
+            {'params': hydra_groups[0]['params'], 'lr_scale': hydra_lr_scale},
+            {'params': hydra_groups[1]['params'], 'weight_decay': 0.,
+             'lr_scale': hydra_lr_scale},
+        ]
     return [
         {'params': student_groups[0]['params'] + hydra_groups[0]['params']},
         {'params': student_groups[1]['params'] + hydra_groups[1]['params'], 'weight_decay': 0.},
@@ -1019,6 +1147,8 @@ class Hydra(nn.Module):
         with torch.no_grad():
             u = F.normalize(h_t.detach().float(), dim=-1)
             self.monitor['cls_cos'] = float((u @ u.T).mean())
+            u0, u1 = u.chunk(2, dim=0)
+            self.monitor['cls_pair_cos'] = float((u0 * u1).sum(dim=-1).mean())
         return (loss0 + loss1) / 2
 
 
