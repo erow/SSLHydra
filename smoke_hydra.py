@@ -427,17 +427,62 @@ def _run_warmup(args, loader, student, teacher, hydra, table, opt):
 
 
 class DiagnosticHydra(Hydra):
-    """Smoke-only negative exclusion. Production Hydra is unchanged."""
+    """Smoke-only variants of the loss. Production Hydra is unchanged."""
     exclude_similar = False
     share_partners = False
+    # 'ln' is production. 'bn' batch-centres queries so a batch-constant query is all zeros.
+    query_norm = 'ln'
+    # 'pair' reads both descriptors (production), 'anchor' only the query's, 'ones' is no gate.
+    # 'frozen' is the pair gate at its random init. 'agree' has no weights to train: a
+    # coordinate opens when a fixed random projection of the two descriptors has the same sign.
+    gate_mode = 'pair'
+    gate_beta = 3.
+    # Chance that a draw is the anchor's own other view instead of a sampled partner.
+    self_prob = 0.
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.query_bn = nn.BatchNorm1d(self.out_dim, affine=False)
+        generator = torch.Generator().manual_seed(0)
+        self.register_buffer('agree_proj', torch.randn(
+            self.gate[0].in_features, self.out_dim, generator=generator), persistent=False)
+
+    def _gate(self, refs, rows, partner):
+        """Gate of each (anchor, partner) pair, [B, D]."""
+        if self.gate_mode == 'agree':
+            code = refs.float() @ self.agree_proj
+            code = (code - code.mean(0)) / code.std(0).clamp_min(1e-6)
+            gate = (self.gate_beta * code[rows] * code[partner]).sigmoid()
+        else:
+            other = rows if self.gate_mode == 'anchor' else partner
+            with torch.set_grad_enabled(self.gate_mode != 'frozen'):
+                gate = self.gate((refs[rows].float() + refs[other].float()) * .5).sigmoid()
+            if self.gate_mode == 'ones':
+                gate = gate * 0 + 1
+        # Keeps the gate parameters in the DDP graph for the modes that do not train them.
+        return gate + 0 * sum(p.sum() for p in self.gate.parameters())
 
     def forward(self, h_s, h_t, guide):
         self._shared_partners = []
         self.direction_partners = []
-        loss = super().forward(h_s, h_t, guide)
+        z_s = self.predictor(self.projector(h_s))
+        if self.query_norm == 'bn':
+            z_s = self.query_bn(z_s.float())
+        with torch.no_grad():
+            z_t = self.key_bn(self.teacher_projector(h_t))
+        guide = guide.detach()
+        q0, q1 = z_s.chunk(2, dim=0)
+        k0, k1 = z_t.chunk(2, dim=0)
+        loss0 = self._direction(q0, k1, guide)
+        mon0 = dict(self.monitor)
+        loss1 = self._direction(q1, k0, guide)
+        self.monitor = {key: (mon0[key] + self.monitor[key]) / 2 for key in mon0}
+        with torch.no_grad():
+            u = F.normalize(h_t.detach().float(), dim=-1)
+            self.monitor['cls_cos'] = float((u @ u.T).mean())
         self.monitor['direction_partner_agreement'] = float(
             (self.direction_partners[0] == self.direction_partners[1]).float().mean())
-        return loss
+        return (loss0 + loss1) / 2
 
     def _direction(self, z_s, z_t, guide):
         keys = _all_gather(z_t.detach())
@@ -451,10 +496,13 @@ class DiagnosticHydra(Hydra):
                 partner = self._shared_partners[draw]
             else:
                 partner = _sample_rows(refs, rows, 'sim', self.tau)
+                if self.self_prob > 0:
+                    own = torch.rand(b, device=rows.device) < self.self_prob
+                    partner = torch.where(own, rows, partner)
                 if self.share_partners:
                     self._shared_partners.append(partner)
             partners.append(partner)
-            gate = self.gate((refs[rows].float() + refs[partner].float()) * .5).sigmoid()
+            gate = self._gate(refs, rows, partner)
             logits = fused_gated_contrast(z_s.float(), keys.float(), gate) / self.temperature
             reference = F.normalize(refs[rows].float(), dim=-1) @ F.normalize(refs.float(), dim=-1).T
             excluded = torch.zeros_like(logits, dtype=torch.bool)
@@ -476,6 +524,8 @@ class DiagnosticHydra(Hydra):
                     'top1': float((logits.argmax(1) == partner).float().mean()),
                     'positive_rank': float(1 + (logits > pos[:, None]).sum(1).float().mean()),
                     'reference_better_negative_fraction': float(better.any(1).float().mean()),
+                    'self_fraction': float((partner == rows).float().mean()),
+                    'gate_mean': float(gate.mean()), 'gate_std': float(gate.std()),
                     'zs_std': float(z_s.float().std(0, unbiased=False).mean()),
                     'zt_std': float(keys.float().std(0, unbiased=False).mean()),
                 }
@@ -505,8 +555,8 @@ def _diagnostic_probe(args, student, teacher, hydra, table, batch, pair_seed):
     modes = [m.training for m in modules]
     cpu_rng, gpu_rng = torch.get_rng_state(), torch.cuda.get_rng_state()
     student.eval(); teacher.eval(); hydra.train()
-    probe_k, probe_shared = hydra.module.k, hydra.module.share_partners
-    hydra.module.k, hydra.module.share_partners = 1, False
+    probe_k, probe_shared, probe_self = hydra.module.k, hydra.module.share_partners, hydra.module.self_prob
+    hydra.module.k, hydra.module.share_partners, hydra.module.self_prob = 1, False, 0.
     torch.manual_seed(pair_seed)
     _loss(student, teacher, hydra, table, batch, args)
     result = dict(hydra.module.probe_monitor)
@@ -518,6 +568,9 @@ def _diagnostic_probe(args, student, teacher, hydra, table, batch, pair_seed):
     for name, changed in [('shuffled_query_loss', shuffled), ('constant_query_loss', constant)]:
         logits = fused_gated_contrast(changed.float(), keys.float(), gate.float()) / hydra.module.temperature
         result[name] = float(F.cross_entropy(logits.masked_fill(excluded, -torch.inf), target))
+    # Same queries, keys and targets with the gate removed: what the gate itself contributes.
+    logits = fused_gated_contrast(q.float(), keys.float(), torch.ones_like(gate).float()) / hydra.module.temperature
+    result['ungated_loss'] = float(F.cross_entropy(logits.masked_fill(excluded, -torch.inf), target))
     result = _mean_metrics(result)
     # All workers already have global tensors. Compute the spectrum only on rank 0.
     if utils.is_main_process():
@@ -533,7 +586,7 @@ def _diagnostic_probe(args, student, teacher, hydra, table, batch, pair_seed):
         buffer.copy_(saved)
     for module, mode in zip(modules, modes):
         module.train(mode)
-    hydra.module.k, hydra.module.share_partners = probe_k, probe_shared
+    hydra.module.k, hydra.module.share_partners, hydra.module.self_prob = probe_k, probe_shared, probe_self
     torch.set_rng_state(cpu_rng); torch.cuda.set_rng_state(gpu_rng)
     return result
 
@@ -661,6 +714,131 @@ def _run_diagnose(args, loader, student, teacher, hydra, table, opt):
     torch.distributed.barrier()
 
 
+def _make_pool(loader, table, batches):
+    """First global crop of a few batches, with labels and reference rows, kept on CPU."""
+    images, labels, refs = [], [], []
+    iterator = iter(loader)
+    for _ in range(batches):
+        ims, lab, _, idx = next(iterator)
+        images.append(ims[0].cpu().clone())
+        labels.append(lab.cpu().clone().view(-1))
+        refs.append(table.take(idx.cpu()))
+    iterator.close()
+    labels = _all_gather(torch.cat(labels).cuda())
+    refs = F.normalize(_all_gather(torch.cat(refs).cuda()), dim=-1)
+    sim = refs @ refs.T
+    sim.fill_diagonal_(-torch.inf)
+    return {
+        'images': images, 'labels': labels, 'ref_top': sim.topk(10, dim=1).indices,
+        'ref_nn1': float((labels[sim.argmax(1)] == labels).float().mean()),
+    }
+
+
+@torch.no_grad()
+def _semantic_probe(student, teacher, pool):
+    """Does the backbone [CLS] group images the way labels and the reference do?"""
+    backbone = student.module.backbone
+    masked, modes = backbone.masked_im_modeling, (student.training, teacher.training)
+    backbone.masked_im_modeling = False
+    student.eval(); teacher.eval()
+    result = {}
+    for name, net in (('student', student.module), ('teacher', teacher)):
+        feats = torch.cat([_cls(net, [im.cuda(non_blocking=True)], None).float() for im in pool['images']])
+        feats = _all_gather(feats)
+        if not utils.is_main_process():
+            continue
+        z = F.normalize(feats - feats.mean(0), dim=-1)
+        sim = z @ z.T
+        sim.fill_diagonal_(-torch.inf)
+        top = sim.topk(10, dim=1).indices
+        labels = pool['labels']
+        result[name + '_nn1'] = float((labels[top[:, 0]] == labels).float().mean())
+        result[name + '_ref_recall10'] = float(
+            (top[:, :, None] == pool['ref_top'][:, None, :]).any(-1).float().mean())
+        spectrum = torch.linalg.svdvals(z).square()
+        mass = spectrum / spectrum.sum().clamp_min(1e-30)
+        result[name + '_cls_rank'] = float((-(mass * mass.clamp_min(1e-30).log()).sum()).exp())
+    backbone.masked_im_modeling = masked
+    student.train(modes[0]); teacher.train(modes[1])
+    return result
+
+
+def _run_scratch(args, loader, student, teacher, hydra, table, opt):
+    """One streaming condition from random weights, probed while it trains."""
+    if args.use_fp16 or args.hydra_pair != 'sim':
+        raise ValueError('scratch requires FP32 and sim pairing')
+    h = hydra.module
+    h.k, h.share_partners = args.hydra_k, args.share_partners
+    h.query_norm, h.gate_mode, h.self_prob = args.query_norm, args.gate_mode, args.self_prob
+    h.gate_beta = args.gate_beta
+    if args.init_ibot:
+        _load_ibot(student, teacher)
+    output = os.path.join(args.output_dir, 'diagnostics.jsonl')
+    if utils.is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    def record(data):
+        if utils.is_main_process():
+            print('DIAG ' + json.dumps(data), flush=True)
+            with open(output, 'a') as f:
+                f.write(json.dumps(data) + '\n')
+
+    utils.fix_random_seeds(args.seed)
+    loader.set_epoch(1)
+    pool = _make_pool(loader, table, args.pool_batches)
+    loader.set_epoch(0)
+    probe_batch = _one_batch(loader)
+    record({'stage': 'config', 'tag': args.tag, 'steps': args.steps, 'lr': args.lr,
+            'global_batch': args.batch_size_per_gpu * utils.get_world_size(),
+            'K': h.k, 'shared_partners': h.share_partners, 'query_norm': h.query_norm,
+            'gate_mode': h.gate_mode, 'gate_beta': h.gate_beta, 'self_prob': h.self_prob, 'tau': h.tau,
+            'temperature': h.temperature, 'hydra_out_dim': h.out_dim,
+            'hydra_mlp_dim': args.hydra_mlp_dim, 'momentum': args.momentum_teacher,
+            'init_ibot': bool(args.init_ibot), 'pool': int(pool['labels'].numel()),
+            'pool_reference_nn1': pool['ref_nn1']})
+    loader.set_epoch(0)
+    student.train(); teacher.eval(); hydra.train()
+    pair_seed = args.seed + 987
+
+    def probe(step):
+        data = _diagnostic_probe(args, student, teacher, hydra, table, probe_batch, pair_seed)
+        data.update(_semantic_probe(student, teacher, pool))
+        record(dict(tag=args.tag, stage='probe', step=step, **data))
+
+    probe(0)
+    epoch = 0
+    iterator = iter(loader)
+    for step in range(args.steps):
+        for group in opt.param_groups:
+            group['lr'] = args.lr * min(1., (step + 1) / max(1, args.lr_warmup))
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            # Runs longer than one pass start the next epoch's order.
+            epoch += 1
+            loader.set_epoch(epoch)
+            iterator = iter(loader)
+            batch = next(iterator)
+        opt.zero_grad(set_to_none=True)
+        loss = _loss(student, teacher, hydra, table, batch, args)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f'{args.tag}: nonfinite loss at {step}')
+        loss.backward()
+        norm = _grad_norm(student, hydra)
+        if args.clip_grad:
+            utils.clip_gradients(student, args.clip_grad)
+            utils.clip_gradients(hydra, args.clip_grad)
+        opt.step()
+        _ema(student, teacher, hydra, args.momentum_teacher)
+        if step % 25 == 0 or step + 1 == args.steps:
+            record(dict(tag=args.tag, stage='train', step=step,
+                        **_mean_metrics(dict(h.monitor, gnorm=norm))))
+        if (step + 1) % args.probe_every == 0 or step + 1 == args.steps:
+            probe(step + 1)
+    iterator.close()
+    torch.distributed.barrier()
+
+
 def main():
     parser = get_args_parser()
     parser.add_argument('--steps', default=1000, type=int)
@@ -671,6 +849,17 @@ def main():
                         help='With --diagnose, run pretrained/shared-partner/K=8 stream validation')
     parser.add_argument('--partner_control', action='store_true',
                         help='With --diagnose, compare fixed vs redrawn partners on identical frozen images')
+    parser.add_argument('--scratch', action='store_true',
+                        help='With --diagnose, one from-scratch stream condition with periodic probes')
+    parser.add_argument('--tag', default='scratch')
+    parser.add_argument('--share_partners', action='store_true')
+    parser.add_argument('--query_norm', default='ln', choices=['ln', 'bn'])
+    parser.add_argument('--gate_mode', default='pair', choices=['pair', 'anchor', 'ones', 'frozen', 'agree'])
+    parser.add_argument('--gate_beta', default=3., type=float)
+    parser.add_argument('--self_prob', default=0., type=float)
+    parser.add_argument('--probe_every', default=250, type=int)
+    parser.add_argument('--pool_batches', default=16, type=int)
+    parser.add_argument('--lr_warmup', default=0, type=int)
     parser.add_argument('--warmup', action='store_true')
     parser.add_argument('--warmup_steps', default=100, type=int)
     parser.add_argument('--one_epoch', action='store_true')
@@ -678,6 +867,9 @@ def main():
     parser.add_argument('--why_steps', default=60, type=int)
     args = parser.parse_args()
     loader, student, teacher, hydra, table, opt = _build(args)
+    if args.diagnose and args.scratch:
+        _run_scratch(args, loader, student, teacher, hydra, table, opt)
+        return
     if args.diagnose:
         _run_diagnose(args, loader, student, teacher, hydra, table, opt)
         return

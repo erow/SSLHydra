@@ -180,7 +180,8 @@ def restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
     print("Found checkpoint at {}".format(ckp_path))
 
     # open checkpoint file
-    checkpoint = torch.load(ckp_path, map_location="cpu")
+    # Our checkpoints hold argparse Namespaces and numpy scalars; the torch>=2.6 default rejects them.
+    checkpoint = torch.load(ckp_path, map_location="cpu", weights_only=False)
 
     # key is what to look for in the checkpoint file
     # value is the object to load
