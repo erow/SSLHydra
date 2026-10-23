@@ -13,6 +13,7 @@ https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from functools import partial
 from utils import trunc_normal_
@@ -129,7 +130,12 @@ class PatchEmbed(nn.Module):
             
     def forward(self, x):
         B, C, H, W = x.shape
-        return self.proj(x)
+        # Same result as self.proj(x), as a matmul. The fp32 MIOpen conv kernel fails to build on
+        # LUMI-G (miopenStatusUnknownError, LDS limit), so avoid MIOpen for this layer.
+        p = self.patch_size
+        x = x.reshape(B, C, H // p, p, W // p, p).permute(0, 2, 4, 1, 3, 5).reshape(B, H // p, W // p, C * p * p)
+        out = F.linear(x, self.proj.weight.reshape(self.proj.out_channels, -1), self.proj.bias)
+        return out.permute(0, 3, 1, 2).contiguous()
 
 class VisionTransformer(nn.Module):
     """ Vision Transformer """

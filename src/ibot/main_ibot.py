@@ -913,7 +913,8 @@ def _label_monitor(z_s, keys, labels, rows, logits, has):
         weights = same.float()
         weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1)
         log_p = logits.detach().float().log_softmax(dim=1)
-        ref_h = -(weights * log_p).sum(dim=1)
+        # Own key is masked to -inf; its weight is 0 and 0 * -inf would be NaN.
+        ref_h = -(weights * log_p.masked_fill(weights == 0, 0)).sum(dim=1)
         ref_ent = -(weights * weights.clamp_min(1e-12).log()).sum(dim=1)
         if has.any():
             ref_h = float(ref_h[has].mean())
@@ -1065,7 +1066,8 @@ class Hydra(nn.Module):
         has = None
         filtered_records = []
         gate_records = []
-        for _ in range(self.k):
+        draws = 1 if label else self.k  # the label loss already averages over all positives
+        for _ in range(draws):
             with torch.no_grad():
                 if label:
                     t_idx, has = _label_partner(gathered, rows)
@@ -1096,7 +1098,19 @@ class Hydra(nn.Module):
                     gate_records.append(self.gate_stats)
                 logits = fused_gated_contrast(z_s.float(), keys.float(), gate) / self.temperature
             if label:
-                term = F.cross_entropy(logits[has], t_idx[has]) if has.any() else logits.sum() * 0
+                # SupCon-style: the loss is the mean InfoNCE over every same-class key in the batch.
+                # The query's other view is removed from numerator and denominator.
+                excluded = torch.zeros_like(logits, dtype=torch.bool)
+                excluded.scatter_(1, rows[:, None], True)
+                logits = logits.masked_fill(excluded, float('-inf'))
+                pos = gathered.unsqueeze(0).eq(gathered[rows].unsqueeze(1)) & ~excluded
+                n_pos = pos.sum(1)
+                has = n_pos > 0
+                log_p = logits.log_softmax(dim=1).masked_fill(~pos, 0)
+                if has.any():
+                    term = -(log_p.sum(1)[has] / n_pos[has]).mean()
+                else:
+                    term = logits.sum() * 0
             else:
                 excluded = torch.zeros_like(logits, dtype=torch.bool)
                 if self.strategy != 'self':
@@ -1129,7 +1143,7 @@ class Hydra(nn.Module):
             'gate_hi': self.gate_stats['hi'],
             'neg_filtered': (sum(filtered_records) / len(filtered_records) if filtered_records else 0.0),
         })
-        return total / self.k
+        return total / draws
 
     def forward(self, h_s, h_t, guide):
         # Both views share one norm. Chunk only after that.

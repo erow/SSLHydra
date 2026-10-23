@@ -124,7 +124,9 @@ class DiagnosticTests(unittest.TestCase):
                                type_ignores=[]), 'smoke_hydra.py', 'exec'), namespace)
         diagnostic = namespace['DiagnosticHydra'](6, 8, 16, .2, .1, 1, 'sim')
         baseline = Hydra(6, 8, 16, .2, .1, 1, 'sim')
-        baseline.load_state_dict(diagnostic.state_dict())
+        # query_bn belongs only to the diagnostic variant.
+        baseline.load_state_dict({name: value for name, value in diagnostic.state_dict().items()
+                                  if not name.startswith('query_bn.')})
         qs = torch.randn(16, 8, requires_grad=True)
         kt = torch.randn(16, 8, requires_grad=True)
         refs = torch.randn(8, 6)
@@ -153,7 +155,9 @@ class DiagnosticTests(unittest.TestCase):
         torch.manual_seed(71)
         diagnostic = namespace['DiagnosticHydra'](6, 8, 16, .2, .1, 4, 'sim')
         baseline = Hydra(6, 8, 16, .2, .1, 4, 'sim')
-        baseline.load_state_dict(diagnostic.state_dict())
+        # query_bn belongs only to the diagnostic variant.
+        baseline.load_state_dict({name: value for name, value in diagnostic.state_dict().items()
+                                  if not name.startswith('query_bn.')})
         qs = torch.randn(16, 8, requires_grad=True)
         kt = torch.randn(16, 8, requires_grad=True)
         refs = torch.randn(8, 6)

@@ -1,13 +1,32 @@
-data/
-data
-work_dirs/
-work_dirs
-*.zip
+# Python
 __pycache__/
-.*
-.*/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+# Data, checkpoints and runtime artifacts
+data/
+/datasets/
+outputs/
+work_dirs/
+work/
+slurm
+wandb/
 *.pth
+*.pt
+*.ffcv
+*.npy
+*.npz
 *.out
-pics/
-!.github/
-!.gitignore
+*.err
+*.zip
+core
+core.*
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.aws/
+.codex/
+.claude/
+.cursor/
